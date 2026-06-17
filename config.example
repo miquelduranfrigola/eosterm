@@ -14,10 +14,25 @@
 # Per-host SSH connect timeout (seconds).
 # TUIMUX_SSH_TIMEOUT=5
 
-# Which terminal to drive when opening sessions in new tabs/windows (macOS).
-# Auto-detected from $TERM_PROGRAM: "ghostty" for Ghostty, otherwise Apple
-# Terminal.app. Set this to force a driver (e.g. from an unsupported terminal).
-# TUIMUX_TERM=ghostty   # or: terminal
+# Which terminal to drive when opening sessions in new tabs/windows. Auto-detected;
+# set to force a driver. macOS: ghostty | terminal (Apple Terminal.app).
+# Linux: gnome (GNOME Terminal) | custom (use TUIMUX_TERM_CMD) | generic.
+# TUIMUX_TERM=ghostty
+
+# Linux only — open sessions in ANY terminal via a command template. {cmd} is
+# replaced with the (shell-quoted) command to run; wrap it for your terminal.
+# Setting this selects the "custom" driver. Examples:
+#   TUIMUX_TERM_CMD='kitty -e sh -c {cmd}'
+#   TUIMUX_TERM_CMD='wezterm start -- sh -c {cmd}'
+#   TUIMUX_TERM_CMD='alacritty -e sh -c {cmd}'
+
+# Force the platform detection (normally from `uname`). Rarely needed; handy for
+# testing the Linux launch paths from macOS. darwin | linux.
+# TUIMUX_OS=linux
+
+# Print the exact terminal-launch command instead of running it (debugging /
+# dry-run). Any non-empty value enables it.
+# TUIMUX_DRY_RUN=1
 
 # TERM used for remote sessions. Ghostty's own terminfo (xterm-ghostty) usually
 # isn't installed on other machines, which makes remote tmux abort; the default

@@ -9,11 +9,19 @@ See and jump into every tmux session on every machine on your
 pip install .          # or: pipx install .
 ```
 
-Needs `tmux`, `ssh`, `tailscale`, and a terminal. On macOS, opening sessions in
-new tabs/windows works with **Ghostty** (recommended) and **Apple Terminal.app**;
-any other terminal falls back to Terminal.app (force a driver with
-`TUIMUX_TERM=ghostty|terminal`). On each remote machine: `sudo tailscale up --ssh`
-and install `tmux`.
+Needs `tmux`, `ssh`, `tailscale`, and a terminal. Opening sessions in new
+tabs/windows is supported on:
+
+- **macOS** — **Ghostty** (recommended) and **Apple Terminal.app**; any other
+  terminal falls back to Terminal.app.
+- **Linux** — **GNOME Terminal** (real tabs + windows), or **any** terminal via a
+  `TUIMUX_TERM_CMD` template (e.g. `kitty -e sh -c {cmd}`). Jumping to an
+  already-open session and the "OPEN IN" column additionally need **X11** with
+  `wmctrl` (or `xdotool`) installed — on Wayland every open is a new surface.
+
+Force a driver with `TUIMUX_TERM` and override platform detection with `TUIMUX_OS`
+if needed. Run `tuimux doctor` to see what's detected. On each remote machine:
+`sudo tailscale up --ssh` and install `tmux`.
 
 ## Use
 

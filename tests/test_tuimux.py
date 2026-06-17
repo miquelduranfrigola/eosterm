@@ -6,7 +6,10 @@ standalone with `python tests/test_tuimux.py`.
 """
 
 import contextlib
+import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -260,6 +263,91 @@ def test_open_in_cell():
     assert a._open_in_cell({"name": "build", "open_in": "ghostty"})[0] == "other window"
     # attached but no local tab found → fall back to the terminal type
     assert a._open_in_cell({"name": "zzz", "open_in": "ghostty"})[0] == "ghostty"
+
+
+# ---- Linux spawn command builder (engine.sh) --------------------------------
+# These shell out to the engine forcing TUIMUX_OS=linux + TUIMUX_DRY_RUN=1, so they
+# exercise the Linux launch-command construction on any platform (incl. this macOS
+# box) without ever opening a GUI window or touching osascript.
+def _engine_dry(args, env=None):
+    e = {**os.environ, "TUIMUX_OS": "linux", "TUIMUX_DRY_RUN": "1"}
+    if env:
+        e.update(env)
+    return subprocess.run(
+        ["bash", app.ENGINE, *args], capture_output=True, text=True, env=e
+    ).stdout
+
+
+def test_linux_gnome_tab():
+    out = _engine_dry(
+        ["__open", "tab", "macmini", "main", "attach"], {"TUIMUX_TERM": "gnome"}
+    )
+    assert (
+        out.strip()
+        == f"[dry-run] gnome-terminal --tab -- bash {app.ENGINE} __attach macmini main attach"
+    )
+
+
+def test_linux_gnome_window_carries_identity_and_quotes_spaces():
+    out = _engine_dry(
+        ["__open", "window", "macmini", "weird name", "attach"],
+        {"TUIMUX_TERM": "gnome", "TUIMUX_SELF_HOST": "mybox"},
+    )
+    assert "gnome-terminal --window -- env TUIMUX_SELF_HOST=mybox bash" in out
+    assert "weird\\ name attach" in out  # the spaced session name stays one token
+
+
+def test_linux_custom_template_wraps_via_sh():
+    out = _engine_dry(
+        ["__open", "tab", "macmini", "main", "attach"],
+        {"TUIMUX_TERM_CMD": "kitty -e sh -c {cmd}"},
+    )
+    assert out.startswith("[dry-run] sh -c ")
+    # {cmd} expanded to the engine invocation, wrapped for the user's terminal
+    for piece in ("kitty", "__attach", "macmini", "main"):
+        assert piece in out
+
+
+def test_linux_generic_terminal_window_only():
+    out = _engine_dry(
+        ["__open", "window", "macmini", "main", "new"],
+        {"TUIMUX_TERM": "generic", "TERMINAL": "alacritty"},
+    )
+    assert (
+        out.strip()
+        == f"[dry-run] alacritty -e bash {app.ENGINE} __attach macmini main new"
+    )
+
+
+def test_linux_wayland_auto_falls_through_to_new_surface():
+    # Wayland blocks jump-to-window, so `auto` can't focus → opens a fresh tab.
+    out = _engine_dry(
+        ["__open", "auto", "macmini", "happy-curie", "attach"],
+        {"TUIMUX_TERM": "gnome", "XDG_SESSION_TYPE": "wayland"},
+    )
+    assert "[dry-run] gnome-terminal --tab -- bash" in out
+    assert "__attach macmini happy-curie attach" in out
+
+
+def test_linux_list_windows_x11_keeps_only_terminals():
+    with tempfile.TemporaryDirectory() as d:
+        stub = os.path.join(d, "wmctrl")
+        with open(stub, "w") as f:
+            f.write(
+                "#!/bin/bash\n"
+                'if [ "$1" = "-lx" ]; then\n'
+                '  echo "0x01 0 gnome-terminal-server.Gnome-terminal h tuimux"\n'
+                '  echo "0x02 0 gnome-terminal-server.Gnome-terminal h happy-curie · main"\n'
+                '  echo "0x03 0 firefox.Firefox h Mozilla Firefox"\n'
+                "fi\n"
+            )
+        os.chmod(stub, 0o755)
+        out = _engine_dry(
+            ["__windows"],
+            {"XDG_SESSION_TYPE": "x11", "PATH": d + os.pathsep + os.environ["PATH"]},
+        )
+    # firefox dropped; terminals emitted as "<n>|<title>" for the OPEN IN column
+    assert out.strip().splitlines() == ["1|tuimux", "2|happy-curie · main"]
 
 
 if __name__ == "__main__":

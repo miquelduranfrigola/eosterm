@@ -72,6 +72,43 @@ term_kind() {
   esac
 }
 
+# Platform we open new terminal surfaces on: darwin (osascript) or linux. macOS
+# drives Ghostty/Terminal.app via AppleScript; Linux launches a terminal binary.
+# Override with TUIMUX_OS=darwin|linux (mirrors TUIMUX_TERM; lets the Linux paths
+# be exercised from a Mac, and forces a choice on an unrecognised `uname`).
+os_kind() {
+  case "${TUIMUX_OS:-$(uname 2>/dev/null)}" in
+    Darwin|darwin) echo darwin ;;
+    *)             echo linux ;;
+  esac
+}
+
+# Which Linux terminal to launch — gnome (GNOME Terminal / VTE family), custom
+# (TUIMUX_TERM_CMD template), or generic (x-terminal-emulator/$TERMINAL). TUIMUX_TERM
+# forces it; otherwise sniff the VTE env and fall back to what's on PATH.
+linux_term() {
+  [ -n "${TUIMUX_TERM_CMD:-}" ] && { echo custom; return; }
+  case "${TUIMUX_TERM:-}" in
+    gnome|custom|generic) echo "$TUIMUX_TERM"; return ;;
+  esac
+  if [ -n "${GNOME_TERMINAL_SCREEN:-}${VTE_VERSION:-}" ] || have gnome-terminal; then
+    echo gnome
+  else
+    echo generic
+  fi
+}
+
+# X11 vs Wayland — decides whether jump-to-window / window-listing are possible at
+# all (X11: best-effort via wmctrl; Wayland: the compositor blocks cross-window control).
+linux_display() {
+  case "${XDG_SESSION_TYPE:-}" in
+    wayland) echo wayland; return ;;
+    x11)     echo x11; return ;;
+  esac
+  [ -n "${WAYLAND_DISPLAY:-}" ] && { echo wayland; return; }
+  echo x11
+}
+
 # `tailscale status`/`ip` memoized per invocation via env vars. A single __hosts
 # otherwise shells out to tailscale ~16 times (discover + offline + once per host
 # via self_host); hosts_data fills this cache so its command-substitution
@@ -343,12 +380,12 @@ open_console() {
   else err "no browser opener found (need 'open' or 'xdg-open')"; fi
 }
 
-# ----- spawning new terminal surfaces (macOS) --------------------------------
+# ----- spawning new terminal surfaces ----------------------------------------
 # Opening a session launches a new terminal tab/window that execs straight into
-# ssh+tmux. This is macOS-only (driven via AppleScript / `osascript`). Two
-# drivers — Ghostty and Apple Terminal.app — chosen by term_kind. Everything
-# routes through term_spawn / term_focus / list_windows so the rest of the engine
-# stays terminal-agnostic.
+# ssh+tmux. macOS drives Ghostty / Apple Terminal.app via AppleScript (osascript);
+# Linux launches a terminal binary (GNOME Terminal, or a configured command).
+# Everything routes through term_spawn / term_focus / list_windows, each of which
+# branches on os_kind, so the rest of the engine stays platform-agnostic.
 
 # AppleScript string-escape: backslash and double-quote.
 osa_escape() {
@@ -367,6 +404,48 @@ build_exec_cmd() {
   [ -n "${TUIMUX_SELF_HOST:-}" ] && printf -v out 'exec env TUIMUX_SELF_HOST=%q' "$TUIMUX_SELF_HOST"
   for a in "$@"; do printf -v out '%s %q' "$out" "$a"; done
   printf '%s' "$out"
+}
+
+# Launch a spawned surface's argv. With TUIMUX_DRY_RUN set we just print the exact
+# command (shell-quoted) and succeed — used to verify the Linux launchers without a
+# GUI. Otherwise run it detached so the dashboard never blocks waiting on it.
+do_spawn() {
+  if [ -n "${TUIMUX_DRY_RUN:-}" ]; then
+    local q a; for a in "$@"; do printf -v q '%s %q' "${q:-}" "$a"; done
+    printf '[dry-run]%s\n' "$q"; return 0
+  fi
+  ( "$@" >/dev/null 2>&1 & )
+}
+
+# Linux: launch a new terminal surface running <argv…> (the engine re-invocation).
+# $1 = "tab" or "window". GNOME Terminal gets real tabs (--tab) against its running
+# server; a TUIMUX_TERM_CMD template covers any other terminal; otherwise we fall
+# back to x-terminal-emulator/$TERMINAL (window only). The TUIMUX_SELF_HOST identity
+# hint rides along exactly as on macOS (here as a literal `env VAR=val` argv prefix,
+# since VTE runs the argv directly — no shell to interpret it).
+linux_spawn() {
+  local mode="$1"; shift
+  # env-hint as an argv prefix (empty if unset). The ${env[@]+…} guard keeps an
+  # empty array from tripping `set -u` on bash 3.2.
+  local env=()
+  [ -n "${TUIMUX_SELF_HOST:-}" ] && env=(env "TUIMUX_SELF_HOST=$TUIMUX_SELF_HOST")
+  case "$(linux_term)" in
+    gnome)
+      local flag=--window; [ "$mode" = tab ] && flag=--tab
+      do_spawn gnome-terminal "$flag" -- ${env[@]+"${env[@]}"} "$@" ;;
+    custom)
+      # TUIMUX_TERM_CMD is a template run via `sh -c`; {cmd} ← the engine command
+      # as a single shell-quoted token, so the author wraps it for their terminal,
+      # e.g. 'kitty -e sh -c {cmd}' or 'wezterm start -- sh -c {cmd}'.
+      local cmd resolved; printf -v cmd '%q' "$(build_exec_cmd "$@")"
+      resolved="${TUIMUX_TERM_CMD//\{cmd\}/$cmd}"
+      do_spawn sh -c "$resolved" ;;
+    *)
+      # Generic: most terminals take `-e <cmd> <args…>` for a new window. We pass
+      # argv directly (no shell), so the engine binary runs as the surface process.
+      local term="${TERMINAL:-x-terminal-emulator}"
+      do_spawn "$term" -e ${env[@]+"${env[@]}"} "$@" ;;
+  esac
 }
 
 # Ghostty: drive its own keybind via AppleScript (needs Accessibility), then type
@@ -414,6 +493,7 @@ terminal_spawn() {
 # Spawn dispatcher: mode is "tab" or "window"; the rest is the command + its args.
 term_spawn() {
   local mode="$1"; shift
+  if [ "$(os_kind)" = linux ]; then linux_spawn "$mode" "$@"; return; fi
   case "$(term_kind)" in
     ghostty) case "$mode" in window) ghostty_spawn n "$@" ;; *) ghostty_spawn t "$@" ;; esac ;;
     *)       terminal_spawn "$mode" "$@" ;;
@@ -481,7 +561,23 @@ end tell
 OSA
 }
 
+# Linux/X11: list terminal windows via wmctrl. `wmctrl -lx` gives
+# "<id> <desk> <WM_CLASS> <host> <title…>"; we keep windows whose class looks like a
+# terminal and emit "<n>|<title>". Empty on Wayland or without wmctrl — the UI then
+# falls back to the attaching terminal type. wmctrl sees only the active tab's title
+# per window, so background tabs won't be located (documented limitation).
+linux_windows() {
+  { [ "$(linux_display)" = x11 ] && have wmctrl; } || return 0
+  wmctrl -lx 2>/dev/null | awk '
+    tolower($3) ~ /term/ {
+      title = ""
+      for (i = 5; i <= NF; i++) title = title (i > 5 ? " " : "") $i
+      print ++n "|" title
+    }'
+}
+
 list_windows() {
+  if [ "$(os_kind)" = linux ]; then linux_windows; return; fi
   case "$(term_kind)" in
     ghostty) ghostty_windows ;;
     *)       terminal_windows ;;
@@ -557,7 +653,25 @@ end tell
 OSA
 }
 
+# Linux/X11: raise the window whose title matches the session via wmctrl (or
+# xdotool). Returns non-zero on Wayland / without the tools, so open_surface's auto
+# mode cleanly falls through to opening a fresh surface instead of erroring.
+linux_focus() {
+  local n="$1"
+  [ ${#n} -ge 3 ] || return 1
+  [ "$(linux_display)" = x11 ] || return 1
+  if have wmctrl; then
+    wmctrl -a "$n"
+  elif have xdotool; then
+    local id; id="$(xdotool search --name "$n" 2>/dev/null | head -1)"
+    [ -n "$id" ] && xdotool windowactivate "$id" >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
 term_focus() {
+  if [ "$(os_kind)" = linux ]; then linux_focus "$@"; return; fi
   case "$(term_kind)" in
     ghostty) ghostty_focus "$@" ;;
     *)       terminal_focus "$@" ;;
@@ -668,8 +782,21 @@ doctor() {
   owner="$(tailscale status 2>/dev/null | awk -v ip="$self_ip" '$1==ip {print $3; exit}')"
   printf 'this machine: %s  (owner %s)\n' "${self_ip:-?}" "${owner:-?}"
   printf 'login user:   %s\n' "$TUIMUX_LOGIN"
-  # how this terminal will open sessions (spawning is macOS-only, via osascript)
-  if have osascript; then
+  # how this machine will open sessions in new terminal surfaces
+  if [ "$(os_kind)" = linux ]; then
+    local lt ld jump
+    lt="$(linux_term)"; ld="$(linux_display)"
+    case "$lt" in
+      gnome)   lt="GNOME Terminal (tabs + windows)" ;;
+      custom)  lt="custom: $TUIMUX_TERM_CMD" ;;
+      generic) lt="${TERMINAL:-x-terminal-emulator} (windows)"; have "${TERMINAL:-x-terminal-emulator}" || lt="$lt — NOT FOUND" ;;
+    esac
+    if [ "$ld" = x11 ] && { have wmctrl || have xdotool; }; then jump="jump-to-window + OPEN IN: yes"
+    elif [ "$ld" = x11 ]; then jump="jump-to-window + OPEN IN: install wmctrl or xdotool"
+    else jump="jump-to-window + OPEN IN: unavailable on Wayland (always a new surface)"; fi
+    printf 'terminal:     linux → %s\n' "$lt"
+    printf 'display:      %s — %s\n\n' "$ld" "$jump"
+  elif have osascript; then
     case "$(term_kind)" in
       ghostty) printf 'terminal:     %s → new tabs/windows via Ghostty\n\n' "${TERM_PROGRAM:-?}" ;;
       *)       printf 'terminal:     %s → new windows via Apple Terminal.app\n\n' "${TERM_PROGRAM:-?}" ;;
