@@ -598,8 +598,10 @@ class Tuimux(App):
         so we match the part before " · " against the session name — per title
         component, so Terminal.app's "<login> — …" decorations don't get in the way."""
         for idx, title in self._windows:
-            if any(p.split(" · ", 1)[0].strip() == session_name
-                   for p in _title_parts(title)):
+            if any(
+                p.split(" · ", 1)[0].strip() == session_name
+                for p in _title_parts(title)
+            ):
                 if self._self_win is not None and idx == self._self_win:
                     return "this window"
                 return "other window"
