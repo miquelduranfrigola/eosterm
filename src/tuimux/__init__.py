@@ -1,4 +1,4 @@
-"""eosterm — Ersilia Open Source Terminals.
+"""tuimux — a TUI for tmux sessions across your tailnet.
 
 A Textual dashboard to open, reach, and keep-awake tmux sessions across your
 Tailscale tailnet. The bash engine (engine.sh) does discovery, probing, and

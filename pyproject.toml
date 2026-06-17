@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "eosterm"
+name = "tuimux"
 version = "0.1.0"
 description = "A terminal dashboard to open, reach, and keep-awake tmux sessions across your Tailscale tailnet."
 readme = "README.md"
@@ -13,11 +13,17 @@ authors = [{ name = "Ersilia Open Source Initiative" }]
 keywords = ["tmux", "tailscale", "ssh", "terminal", "tui", "textual"]
 dependencies = ["textual>=1.0"]
 
+[project.optional-dependencies]
+dev = ["pytest>=7", "ruff"]
+
 [project.scripts]
-eosterm = "eosterm.cli:main"
+tuimux = "tuimux.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/ersilia-os/eosterm"
+Homepage = "https://github.com/ersilia-os/tuimux"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.setuptools]
 package-dir = { "" = "src" }
@@ -26,4 +32,4 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-eosterm = ["engine.sh"]
+tuimux = ["engine.sh"]

@@ -1,18 +1,42 @@
-# eosterm config — copy to ~/.config/eosterm/config and edit.
+# tuimux config — copy to ~/.config/tuimux/config and edit.
 # All values are optional; sensible defaults apply when unset.
 
 # Hosts to scan. Leave empty to auto-derive from `tailscale status`
 # (machines you own that are online, plus this one).
-# EOSTERM_HOSTS="macmini raluy splunk-server"
+# TUIMUX_HOSTS="macmini raluy splunk-server"
 
 # Remote login user for Tailscale SSH. Defaults to your local $USER.
-# EOSTERM_LOGIN="mduranfrigola"
+# TUIMUX_LOGIN="mduranfrigola"
 
 # Session name used when you create one without naming it.
-# EOSTERM_DEFAULT_SESSION="main"
+# TUIMUX_DEFAULT_SESSION="main"
 
 # Per-host SSH connect timeout (seconds).
-# EOSTERM_SSH_TIMEOUT=5
+# TUIMUX_SSH_TIMEOUT=5
+
+# TERM used for remote sessions. Ghostty's own terminfo (xterm-ghostty) usually
+# isn't installed on other machines, which makes remote tmux abort; the default
+# is the universally-present xterm-256color. (Local sessions keep your TERM.)
+# TUIMUX_REMOTE_TERM=xterm-256color
+
+# Pause (seconds) after opening a Ghostty tab/window before the command is typed
+# into it. Lower = snappier opens; raise it only if the first keystrokes ever get
+# dropped when opening a session on a slow machine.
+# TUIMUX_SPAWN_DELAY=0.2
 
 # Dashboard auto-refresh interval (seconds).
-# EOSTERM_REFRESH=3
+# TUIMUX_REFRESH=3
+
+# How long the dashboard waits for one host's probe before showing it as "busy"
+# (reachable but too loaded to answer in time). Probes run per-host and off the
+# UI thread, so a slow host never blocks the rest.
+# TUIMUX_PROBE_TIMEOUT=10
+
+# How long a mutating action (detach/close/rename/keep-awake) may run.
+# TUIMUX_ACTION_TIMEOUT=15
+
+# How long host discovery (tailscale status) may run before giving up this tick.
+# TUIMUX_HOSTS_TIMEOUT=8
+
+# How long the Ghostty window/tab scan (used for the "OPEN IN" column) may run.
+# TUIMUX_WINDOWS_TIMEOUT=5
