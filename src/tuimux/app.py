@@ -8,7 +8,9 @@ purely the front-end, calling it for data and actions.
 
 import os
 import re
+import shutil
 import subprocess
+import sys
 import time
 from importlib.resources import files
 
@@ -476,6 +478,23 @@ class Tuimux(App):
         self.title = "tuimux"
         self.sub_title = os.environ.get("TERM_PROGRAM", "terminal").lower()
         self._load_subtitle()  # fill in the login name off the UI thread
+        # On Linux X11, jumping to an already-open tab and the OPEN IN column
+        # need wmctrl or xdotool — without them the dashboard can't see local
+        # tabs at all, so every "open" silently spawns a fresh surface. Surface
+        # this once at startup so users don't have to run `tuimux doctor` to
+        # find out.
+        if (
+            sys.platform.startswith("linux")
+            and os.environ.get("XDG_SESSION_TYPE", "x11") == "x11"
+            and not shutil.which("wmctrl")
+            and not shutil.which("xdotool")
+        ):
+            self.notify(
+                "Install wmctrl (or xdotool) to jump to existing tabs — "
+                "without it, every open spawns a new tab.",
+                severity="warning",
+                timeout=12,
+            )
         for theme in ("tokyo-night", "catppuccin-mocha", "nord"):
             try:
                 self.theme = theme
@@ -607,12 +626,11 @@ class Tuimux(App):
                 return "other window"
         return None
 
-    def _open_in_cell(self, s):
+    def _open_in_cell(self, s, loc):
         """OPEN IN segment: which window the session is open in, else the
         attaching terminal type, else detached."""
         if s["open_in"] == "detached":
             return ("detached", "dim")
-        loc = self._window_label(s["name"])
         if loc:
             return (loc, LOCAL if loc == "this window" else REMOTE)
         return (s["open_in"], REMOTE)  # attached, but tab not found locally
@@ -687,13 +705,18 @@ class Tuimux(App):
                     )
                 )
                 for s in info["sessions"]:  # its sessions, indented beneath it
+                    # `open` means "we have a confirmed local tab to jump to" —
+                    # the same signal that drives the OPEN IN cell. If we can't
+                    # pin down the tab, the menu honestly offers a new tab
+                    # instead of promising focus the engine can't deliver.
+                    loc = self._window_label(s["name"])
                     rows.append(
                         _row(
                             {
                                 "host": host,
                                 "session": s["name"],
                                 "action": "attach",
-                                "open": s["open_in"] != "detached",
+                                "open": loc is not None,
                             },
                             name=(
                                 ("  ", ""),
@@ -703,7 +726,7 @@ class Tuimux(App):
                             uptime=((s["uptime"], "dim"),),
                             folder=((s["dir"], CYAN),),
                             tabs=((s["tabs"], "dim"),),
-                            open_in=(self._open_in_cell(s),),
+                            open_in=(self._open_in_cell(s, loc),),
                             agent=(("claude", VIOLET),) if s["agent"] else (),
                         )
                     )
