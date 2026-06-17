@@ -1,0 +1,18 @@
+# eosterm config — copy to ~/.config/eosterm/config and edit.
+# All values are optional; sensible defaults apply when unset.
+
+# Hosts to scan. Leave empty to auto-derive from `tailscale status`
+# (machines you own that are online, plus this one).
+# EOSTERM_HOSTS="macmini raluy splunk-server"
+
+# Remote login user for Tailscale SSH. Defaults to your local $USER.
+# EOSTERM_LOGIN="mduranfrigola"
+
+# Session name used when you create one without naming it.
+# EOSTERM_DEFAULT_SESSION="main"
+
+# Per-host SSH connect timeout (seconds).
+# EOSTERM_SSH_TIMEOUT=5
+
+# Dashboard auto-refresh interval (seconds).
+# EOSTERM_REFRESH=3
