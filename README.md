@@ -35,3 +35,15 @@ tuimux doctor           # check setup
 
 Open / rename / detach / close / keep-awake all happen in the dashboard (footer
 lists the keys). Any tmux session shows up regardless of how it was started.
+
+**Opening a session** lands in a new tab **next to the dashboard** (not in whatever
+window happens to be frontmost), or in a new window if you ask for one. If a session
+is already open on this machine, the menu offers **"go to its tab"** instead of
+opening a duplicate.
+
+**When a machine goes offline** (asleep, off the network, or shut down) its sessions
+don't vanish — they stay listed, dimmed, marked **`unreachable`**, showing what was
+last running. tmux can't tell "asleep" from "shut down" while a machine is away, so
+the honest answer comes on **reconnect**: each session is briefly tagged **`resumed`**
+(the same session survived — its process kept running) or a remembered one is flagged
+**`lost`** (it was shut down / tmux restarted). This memory is in-process only.
