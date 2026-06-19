@@ -930,9 +930,10 @@ bash_login_profile() {
 # Block helpers: present? / append (idempotent, keeps a separating newline) /
 # remove the marked region. index() matches the markers literally (no regex).
 _block_present() { grep -qF "$2" "$1" 2>/dev/null; }   # $1=file $2=begin-marker
-_block_append() {                                        # $1=file $2=snippet-fn
-  [ -s "$1" ] && [ -n "$(tail -c1 "$1" 2>/dev/null)" ] && printf '\n' >> "$1"
-  "$2" >> "$1"
+_block_append() {                          # $1=file $2=snippet-fn [extra args → fn]
+  local f="$1" fn="$2"; shift 2
+  [ -s "$f" ] && [ -n "$(tail -c1 "$f" 2>/dev/null)" ] && printf '\n' >> "$f"
+  "$fn" "$@" >> "$f"
 }
 _block_remove() {                                        # $1=file $2=begin $3=end
   local tmp; [ -f "$1" ] || return 0
@@ -953,25 +954,32 @@ cat <<'SNIP'
 SNIP
 }
 
-# The rc block installed by `tuimux autostart on`. Self-contained (single-quoted
-# heredoc → nothing expands at install time; every $VAR stays live in your shell).
-# `tmux new-session` (no -s) makes a fresh auto-numbered session each time, so each
-# terminal is its own workspace; the set-titles match what the dashboard's window
-# detection ("go to") expects. The skip-marker is how tuimux's OWN spawned tabs
-# (which carry their own attach command) opt out — see term_spawn.
+# The rc block installed by `tuimux autostart on`. $1 = the ABSOLUTE path to the
+# tuimux binary (baked in at install time): a fresh terminal usually hasn't
+# activated the conda env tuimux lives in, so a bare `tuimux` wouldn't be on PATH —
+# the absolute path always resolves. It generates the same happy-curie names tuimux
+# uses elsewhere (`__autoname`), and if it can't run for any reason the session
+# falls back to tmux's numbering. The heredoc is UNQUOTED so the path interpolates;
+# every live shell var is escaped (\$) to stay literal in your rc. set-titles match
+# the dashboard's window detection ("go to"); the skip-marker is how tuimux's OWN
+# spawned tabs opt out (see term_spawn).
 autostart_snippet() {
-cat <<'SNIP'
+  local self="${1:-tuimux}"
+cat <<SNIP
 # >>> tuimux autostart >>>
 # Auto-attach every new interactive terminal to its own tmux session, so it
 # persists and shows up in the tuimux dashboard. Toggle: tuimux autostart off
 # Skip once (e.g. to launch the dashboard itself): TUIMUX_NO_AUTOTMUX=1 <command>
-if [ -z "$TMUX" ] && [ -z "$SSH_CONNECTION" ] && [ -z "$TUIMUX_NO_AUTOTMUX" ] \
+if [ -z "\$TMUX" ] && [ -z "\$SSH_CONNECTION" ] && [ -z "\$TUIMUX_NO_AUTOTMUX" ] \\
    && command -v tmux >/dev/null 2>&1; then
-  case $- in *i*)
-    if [ -e "$HOME/.cache/tuimux/skip-autostart" ]; then
-      command rm -f "$HOME/.cache/tuimux/skip-autostart"   # this tab was opened by tuimux
+  case \$- in *i*)
+    if [ -e "\$HOME/.cache/tuimux/skip-autostart" ]; then
+      command rm -f "\$HOME/.cache/tuimux/skip-autostart"   # this tab was opened by tuimux
     else
-      tmux set -g set-titles on; tmux set -g set-titles-string '#S · #W'; tmux new-session
+      _tx_name="\$('$self' __autoname 2>/dev/null || command tuimux __autoname 2>/dev/null)"
+      tmux set -g set-titles on; tmux set -g set-titles-string '#S · #W'
+      tmux new-session \${_tx_name:+-s "\$_tx_name"} 2>/dev/null || tmux new-session
+      unset _tx_name
     fi ;;
   esac
 fi
@@ -988,7 +996,7 @@ autostart() {
     on)
       have tmux || { err "tmux is not installed here."; exit 1; }
       _block_present "$rc" '# >>> tuimux autostart >>>' \
-        || { _block_append "$rc" autostart_snippet || { err "failed to write $rc"; exit 1; }; did=1; }
+        || { _block_append "$rc" autostart_snippet "$SELF" || { err "failed to write $rc"; exit 1; }; did=1; }
       # bash login shells (macOS) read .bash_profile/.profile, not .bashrc — make
       # sure one of them sources .bashrc, unless it already references it.
       if [ "$kind" = bash ] \
@@ -1100,6 +1108,7 @@ case "${1:-}" in
   __openbrowse  ) shift; open_browse "${1:-}" ;;
   __windows     ) list_windows ;;
   __selfwin     ) self_winid ;;
+  __autoname    ) docker_name ;;
   __console     ) open_console ;;
   __awaketoggle ) shift; toggle_awake "${1:-}" >/dev/null 2>&1 ;;
   -h|--help|"" ) usage ;;

@@ -7,6 +7,7 @@ standalone with `python tests/test_tuimux.py`.
 
 import contextlib
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -202,9 +203,35 @@ def test_autostart_snippet_carries_every_guard():
         '[ -z "$TUIMUX_NO_AUTOTMUX" ]',  # per-shell opt-out
         "case $- in *i*",  # interactive shells only
         "skip-autostart",  # the tuimux-spawned-tab exemption marker
+        "__autoname",  # auto-named (happy-curie), not a bare number
         "tmux new-session",  # each terminal → its own fresh session
     ):
         assert guard in body, guard
+
+
+def test_autostart_bakes_absolute_tuimux_path():
+    # A fresh terminal often hasn't activated the conda env tuimux lives in, so the
+    # snippet must call tuimux by ABSOLUTE path (baked from TUIMUX_BIN), not bare.
+    with tempfile.TemporaryDirectory() as d:
+        rc = os.path.join(d, "rc")
+        fake = "/opt/envs/tuimux/bin/tuimux"
+        subprocess.run(
+            ["bash", app.ENGINE, "autostart", "on"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "TUIMUX_RC": rc, "TUIMUX_BIN": fake},
+        )
+        body = open(rc).read()
+        assert f"'{fake}' __autoname" in body
+
+
+def test_autoname_prints_a_two_word_name():
+    r = subprocess.run(
+        ["bash", app.ENGINE, "__autoname"], capture_output=True, text=True
+    )
+    # docker-style "<adjective>-<scientist>", same generator tuimux uses elsewhere
+    assert r.returncode == 0
+    assert re.fullmatch(r"[a-z]+-[a-z]+", r.stdout.strip()), r.stdout
 
 
 def test_term_spawn_drops_skip_autostart_marker():
