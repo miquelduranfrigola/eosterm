@@ -978,7 +978,10 @@ if [ -z "\$TMUX" ] && [ -z "\$SSH_CONNECTION" ] && [ -z "\$TUIMUX_NO_AUTOTMUX" ]
     else
       _tx_name="\$('$self' __autoname 2>/dev/null || command tuimux __autoname 2>/dev/null)"
       tmux set -g set-titles on; tmux set -g set-titles-string '#S · #W'
-      tmux new-session \${_tx_name:+-s "\$_tx_name"} 2>/dev/null || tmux new-session
+      # An explicit if, NOT a ":+" alternate-value expansion: zsh doesn't word-split
+      # that, so tmux would get one "-s name" token → a " name" with a leading space.
+      if [ -n "\$_tx_name" ]; then tmux new-session -s "\$_tx_name" 2>/dev/null || tmux new-session
+      else tmux new-session; fi
       unset _tx_name
     fi ;;
   esac

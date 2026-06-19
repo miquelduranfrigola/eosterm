@@ -230,6 +230,18 @@ def test_autostart_snippet_carries_every_guard():
         assert guard in body, guard
 
 
+def test_autostart_names_session_portably_not_zsh_broken():
+    # zsh doesn't word-split `${x:+-s "$x"}` the way bash does, which made tmux
+    # create sessions named " name" (leading space) → unopenable. The snippet must
+    # use an explicit, quoted `-s "$_tx_name"` instead.
+    with tempfile.TemporaryDirectory() as d:
+        rc = os.path.join(d, "rc")
+        _autostart("on", rc)
+        body = open(rc).read()
+    assert "${_tx_name:+" not in body  # the zsh-broken splitting trick must be gone
+    assert 'tmux new-session -s "$_tx_name"' in body
+
+
 def test_autostart_bakes_absolute_tuimux_path():
     # A fresh terminal often hasn't activated the conda env tuimux lives in, so the
     # snippet must call tuimux by ABSOLUTE path (baked from TUIMUX_BIN), not bare.
