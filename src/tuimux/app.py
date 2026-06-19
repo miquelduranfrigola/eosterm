@@ -37,6 +37,8 @@ REFRESH = float(os.environ.get("TUIMUX_REFRESH", "3") or 3)
 # refresh still runs on every tick once you're idle, and immediately on returning
 # from a dialog.
 QUIET = float(os.environ.get("TUIMUX_QUIET", "1.2") or 1.2)
+# How long a "resumed"/"lost" verdict stays on screen after a machine reconnects.
+RECONCILE_TTL = float(os.environ.get("TUIMUX_RECONCILE_TTL", "30") or 30)
 AWAKE = "keep-awake"
 SHELLS = {
     "zsh",
@@ -257,11 +259,33 @@ def probe(host):
                 else "detached",
                 "state": state,
                 "uptime": _uptime(s["created"]),
+                "created": s["created"],  # raw epoch — identity key for reconnect
                 "agent": is_agent,
             }
         )
     info["sessions"].sort(key=lambda x: x["auto"].lower())
     return info
+
+
+def _reconcile_sessions(old_sessions, new_sessions):
+    """Compare the last-known-good sessions of a host against what's there now,
+    just after it has come back online. A session is identified by (name, created)
+    — tmux's session_created epoch is stable for the life of a session, so a match
+    means the very same session survived (its process kept running); a miss means
+    the old one is gone (the host was shut down, or tmux/the session restarted).
+
+    Returns {name: "resumed"|"lost"}. Only _got calls this, and only on an
+    unreachable→reachable flip, so routine refreshes never flash badges."""
+    old_ids = {(s["name"], s.get("created", "")) for s in old_sessions}
+    new_ids = {(s["name"], s.get("created", "")) for s in new_sessions}
+    verdicts = {}
+    for s in new_sessions:
+        if (s["name"], s.get("created", "")) in old_ids:
+            verdicts[s["name"]] = "resumed"
+    for s in old_sessions:
+        if (s["name"], s.get("created", "")) not in new_ids:
+            verdicts[s["name"]] = "lost"
+    return verdicts
 
 
 def _probe_or_offline(h):
@@ -455,6 +479,13 @@ class Tuimux(App):
         self._results = {}
         # hosts with a probe currently in flight (avoid double-probing)
         self._probing = set()
+        # host -> last-known-good session list, kept so an offline machine can
+        # still show what was running. Written only from a reachable probe;
+        # never cleared when a host drops off (in-memory only, lost on restart).
+        self._snap = {}
+        # host -> (monotonic_time, {name: "resumed"|"lost"}): transient verdicts
+        # shown briefly after a machine reconnects, then aged out (RECONCILE_TTL).
+        self._reconcile = {}
         self._table = None  # cached DataTable handle (avoids repeated DOM queries)
         # last paint, for cheap diffing: overall signature, per-row keys, cells
         self._last_sig = None
@@ -482,6 +513,7 @@ class Tuimux(App):
         self.title = "tuimux"
         self.sub_title = os.environ.get("TERM_PROGRAM", "terminal").lower()
         self._load_subtitle()  # fill in the login name off the UI thread
+        self._capture_self_window()  # learn our own window id, for "new tab" targeting
         # On Linux X11, jumping to an already-open tab and the OPEN IN column
         # need wmctrl or xdotool — without them the dashboard can't see local
         # tabs at all, so every "open" silently spawns a fresh surface. Surface
@@ -531,6 +563,18 @@ class Tuimux(App):
         self.call_from_thread(
             setattr, self, "sub_title", f"{login} · {term}" if login else term
         )
+
+    @work(thread=True)
+    def _capture_self_window(self):
+        # Some terminals (Terminal.app) don't expose our window's title to the
+        # engine, so "new tab" can't find the dashboard's window by name the way it
+        # can on Ghostty. We capture our window id now — while we're the frontmost
+        # window, just after launch — and pass it on _ENV so every later spawn can
+        # bring this exact window forward before opening the tab. Empty (and thus a
+        # no-op) on terminals that don't need it.
+        wid = _run(["__selfwin"], timeout=WINDOWS_TIMEOUT).stdout.strip()
+        if wid:
+            _ENV["TUIMUX_SELF_WINID"] = wid
 
     # ---- data ----
     # Refresh is incremental and per-host. We fetch the host list, paint every
@@ -589,6 +633,18 @@ class Tuimux(App):
         self.call_from_thread(self._got, h[0], info)
 
     def _got(self, name, info):
+        if info.get("reachable"):
+            prev = self._results.get(name)
+            # Only an actual unreachable→reachable flip reconciles, so routine
+            # refreshes never flash verdicts; compare against the snapshot taken
+            # before it went offline, then refresh the snapshot to the new state.
+            if prev is not None and not prev.get("reachable"):
+                verdicts = _reconcile_sessions(
+                    self._snap.get(name, []), info["sessions"]
+                )
+                if verdicts:
+                    self._reconcile[name] = (time.monotonic(), verdicts)
+            self._snap[name] = info["sessions"]
         self._results[name] = info
         self._probing.discard(name)
         self._render()
@@ -696,6 +752,22 @@ class Tuimux(App):
                         state=((seen, "dim"),) if seen else (),
                     )
                 )
+                # The host is down, but its tmux sessions almost certainly are
+                # not — they're just out of reach until it comes back. Show what
+                # was last running, dimmed, so you know what's "paused" (whether
+                # they actually survive only becomes truthful at reconnect; see
+                # _reconcile_sessions). Non-interactive: there's nothing to attach.
+                for s in self._snap.get(host, []):
+                    rows.append(
+                        _row(
+                            {"host": host, "session": s["name"], "action": "none"},
+                            name=(("  ", ""), (s["auto"], "dim")),
+                            state=((s["state"], "dim"),),
+                            folder=((s["dir"], "dim"),),
+                            tabs=((s["tabs"], "dim"),),
+                            open_in=(("unreachable", "dim italic"),),
+                        )
+                    )
             elif not info["reachable"] and info.get("busy"):
                 # SSH works, the host is just too loaded to answer in time.
                 rows.append(
@@ -730,6 +802,12 @@ class Tuimux(App):
                         state=(("☕ awake", AMBER),) if info["awake"] else (),
                     )
                 )
+                # Just-reconnected? Show for RECONCILE_TTL which sessions are the
+                # same ones as before (resumed) and which are gone (lost).
+                rec = self._reconcile.get(host)
+                verdicts = (
+                    rec[1] if rec and time.monotonic() - rec[0] < RECONCILE_TTL else {}
+                )
                 for s in info["sessions"]:  # its sessions, indented beneath it
                     # `open` means "we have a confirmed local tab to jump to" —
                     # the same signal that drives the OPEN IN cell. If we can't
@@ -752,10 +830,27 @@ class Tuimux(App):
                             uptime=((s["uptime"], "dim"),),
                             folder=((s["dir"], CYAN),),
                             tabs=((s["tabs"], "dim"),),
-                            open_in=(self._open_in_cell(s, loc),),
+                            open_in=(self._open_in_cell(s, loc),)
+                            + (
+                                (("  resumed", GREEN),)
+                                if verdicts.get(s["name"]) == "resumed"
+                                else ()
+                            ),
                             agent=(("claude", VIOLET),) if s["agent"] else (),
                         )
                     )
+                # Sessions that were here before the host dropped but didn't come
+                # back — the host was shut down / tmux restarted, so they're gone.
+                live = {s["name"] for s in info["sessions"]}
+                for name, verdict in verdicts.items():
+                    if verdict == "lost" and name not in live:
+                        rows.append(
+                            _row(
+                                {"host": host, "session": name, "action": "none"},
+                                name=(("  ", ""), (name, "dim")),
+                                open_in=(("lost — not restored", "dim italic"),),
+                            )
+                        )
                 rows.append(
                     _row(
                         {"host": host, "session": "__NEW__", "action": "new"},

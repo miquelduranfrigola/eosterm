@@ -27,7 +27,8 @@ if needed. Run `tuimux doctor` to see what's detected. On each remote machine:
 
 ```sh
 tuimux                  # the dashboard — all you normally need
-tuimux here [name]      # drop this terminal into a tmux session
+tuimux attach [name]    # put this terminal into a tmux session (attach or create)
+tuimux detach           # detach this terminal; the session keeps running
 tuimux init <host>      # auto-tmux a remote's SSH logins
 tuimux doctor           # check setup
 ```

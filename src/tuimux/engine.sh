@@ -5,8 +5,11 @@
 #
 # Usage:
 #   tuimux                    Launch the dashboard — this is all you normally need
-#   tuimux here [name]        Drop THIS terminal into a tmux session (shows up in
-#                             the dashboard); no name = a fresh auto-named one
+#   tuimux attach [name]      Put THIS terminal into a tmux session — attach if it
+#                             exists, create it otherwise (shows up in the dashboard);
+#                             no name = a fresh auto-named one
+#   tuimux detach             Detach THIS terminal's session — it keeps running in
+#                             the background; the terminal drops back to a shell
 #   tuimux init <host>        Make a remote auto-tmux on SSH login (opt-in, asks first)
 #   tuimux doctor             Check local deps + per-host reachability and remote tmux
 #   tuimux -h|--help          This help
@@ -39,6 +42,11 @@ TUIMUX_REMOTE_TERM="${TUIMUX_REMOTE_TERM:-xterm-256color}"
 # it — must cover the new shell becoming ready. Lower = snappier opens; raise it
 # if the first keystrokes ever get dropped on a slower machine.
 TUIMUX_SPAWN_DELAY="${TUIMUX_SPAWN_DELAY:-0.2}"
+# Title the dashboard puts on its own surface (matches app.py `self.title`). A new
+# tab is opened INTO this window, so "new tab" always lands beside the panel —
+# never in whatever window happens to be frontmost (e.g. one you just opened).
+# Keep in sync with app.py's window-self detection.
+TUIMUX_SELF_TITLE="${TUIMUX_SELF_TITLE:-tuimux}"
 
 CONFIG_FILE="${TUIMUX_CONFIG:-$HOME/.config/tuimux/config}"
 # shellcheck disable=SC1090
@@ -57,7 +65,7 @@ SSH_OPTS=(-o ConnectTimeout="$TUIMUX_SSH_TIMEOUT" -o BatchMode=yes -o StrictHost
 err()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
 note() { printf '\033[2m%s\033[0m\n'  "$*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
-usage() { sed -n '3,18p' "$ENGINE_FILE" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,21p' "$ENGINE_FILE" | sed 's/^# \{0,1\}//'; }
 
 # Which terminal we're running inside, normalized to a spawn driver:
 #   ghostty   → drive Ghostty (AppleScript keybind + keystroke)
@@ -362,14 +370,23 @@ surface() {
   exit "$ec"
 }
 
-# `tuimux here [name]` — drop the CURRENT terminal into a (local) tmux session,
+# `tuimux attach [name]` — put the CURRENT terminal into a (local) tmux session,
 # so it persists and shows up in the dashboard. With no name it starts a fresh
 # auto-named session; with a name it creates that one or re-attaches if it
 # exists. Same create-or-attach path (titles + status colour) as the dashboard.
-here_session() {
+attach_here() {
   have tmux || { err "tmux is not installed here."; exit 1; }
   local name="${1:-$(docker_name)}"
   do_attach "$(self_host)" "$name" new exec
+}
+
+# `tuimux detach` — detach THIS terminal from its tmux session: the session keeps
+# running in the background (and stays in the dashboard) while the terminal drops
+# back to a normal shell. The local counterpart to the dashboard's detach (which
+# detaches a named session on any host). A friendly no-op when not inside tmux.
+detach_here() {
+  [ -n "${TMUX:-}" ] || { err "Not inside a tmux session — nothing to detach."; return 0; }
+  tmux detach-client
 }
 
 # Detach a session: drop any attached clients so its tab closes, but keep it
@@ -443,6 +460,20 @@ do_spawn() {
 # back to x-terminal-emulator/$TERMINAL (window only). The TUIMUX_SELF_HOST identity
 # hint rides along exactly as on macOS (here as a literal `env VAR=val` argv prefix,
 # since VTE runs the argv directly — no shell to interpret it).
+# X11: raise the dashboard's own window so a following `gnome-terminal --tab` (which
+# opens into the server's active window) lands beside the panel, not in whatever
+# window is frontmost. Prefer the window id the dashboard captured at startup
+# (TUIMUX_SELF_WINID); fall back to matching the "tuimux" title (VTE does expose the
+# escape-set title in WM_NAME). Best-effort: a no-op on Wayland or without the tools.
+linux_raise_self() {
+  [ "$(linux_display)" = x11 ] || return 0
+  if [ -n "${TUIMUX_SELF_WINID:-}" ]; then
+    have wmctrl && wmctrl -i -a "$TUIMUX_SELF_WINID" 2>/dev/null && return 0
+    have xdotool && xdotool windowactivate "$TUIMUX_SELF_WINID" 2>/dev/null && return 0
+  fi
+  have wmctrl && wmctrl -a "$TUIMUX_SELF_TITLE" 2>/dev/null
+}
+
 linux_spawn() {
   local mode="$1"; shift
   # env-hint as an argv prefix (empty if unset). The ${env[@]+…} guard keeps an
@@ -451,7 +482,9 @@ linux_spawn() {
   [ -n "${TUIMUX_SELF_HOST:-}" ] && env=(env "TUIMUX_SELF_HOST=$TUIMUX_SELF_HOST")
   case "$(linux_term)" in
     gnome)
-      local flag=--window; [ "$mode" = tab ] && flag=--tab
+      local flag=--window
+      # A new tab must land in the dashboard's window; bring it forward first.
+      [ "$mode" = tab ] && { flag=--tab; linux_raise_self; }
       do_spawn gnome-terminal "$flag" -- ${env[@]+"${env[@]}"} "$@" ;;
     custom)
       # TUIMUX_TERM_CMD is a template run via `sh -c`; {cmd} ← the engine command
@@ -475,10 +508,42 @@ linux_spawn() {
 # note: NO `-n`, so it reuses the running instance rather than spawning a second.
 # Speed: Ghostty is already frontmost (we run inside it), so the activate pause is
 # tiny; the bigger wait is for the new shell to be ready — TUIMUX_SPAWN_DELAY.
+# Bring the dashboard's own Ghostty window to the front so a following Cmd-T adds
+# its tab there. Matched by the exact "tuimux" tab/window title; best-effort — if
+# it can't be found we leave focus alone and the tab just opens in the front window.
+ghostty_raise_self() {
+  osascript >/dev/null 2>&1 <<OSA
+tell application "System Events" to tell process "ghostty"
+  set target to missing value
+  repeat with w in windows
+    set hit to false
+    try
+      repeat with r in radio buttons of tab group 1 of w
+        if (name of r) is "$TUIMUX_SELF_TITLE" then set hit to true
+      end repeat
+    end try
+    if (not hit) and (name of w is "$TUIMUX_SELF_TITLE") then set hit to true
+    if hit then
+      set target to w
+      exit repeat
+    end if
+  end repeat
+  if target is missing value then error "no self window"
+  try
+    perform action "AXRaise" of target
+  end try
+  set frontmost to true
+end tell
+OSA
+}
+
 ghostty_spawn() {
   local key="$1"; shift
   local env=()
   [ -n "${TUIMUX_SELF_HOST:-}" ] && env=(env "TUIMUX_SELF_HOST=$TUIMUX_SELF_HOST")
+  # A new tab must land in the dashboard's window, not whatever's frontmost
+  # (e.g. a window you opened a moment ago). New windows are exempt — they're new.
+  [ "$key" = t ] && ghostty_raise_self
   osascript >/dev/null 2>&1 \
     -e 'tell application "Ghostty" to activate' \
     -e 'delay 0.04' \
@@ -490,20 +555,35 @@ ghostty_spawn() {
 }
 
 # Apple Terminal.app: its AppleScript dictionary runs a command directly with
-# `do script` — no keystroke simulation needed, and `do script "cmd"` opens a new
-# WINDOW. For a tab we make one with Cmd-T, then target the new (selected) tab via
-# `do script … in front window`. If the tab keystroke can't be driven we fall back
-# to a new window — so "tab" degrades gracefully to "window" on Terminal.app.
+# `do script` — `do script "cmd"` opens a new WINDOW. For a TAB we make an empty
+# one with Cmd-T (System Events), then run the command in the front window's new
+# (selected) tab via `do script … in front window`. Cmd-T is what reliably creates
+# a *new* tab: `do script … in <window>` won't add a tab while that window's tab is
+# busy (and the dashboard's tab always is), so we don't use it here.
+#
+# Targeting the dashboard's own window for a tab: unlike Ghostty, Terminal.app does
+# NOT expose Textual's title to AppleScript (the dashboard window shows only login +
+# size), so we can't find it by name. Instead the dashboard captured its window id
+# at startup (TUIMUX_SELF_WINID, via __selfwin) while it was frontmost; we bring
+# exactly that window to the front before Cmd-T. Falls back to the front window if
+# the id is unknown or stale (closed) — degrading to the old behaviour, never erroring.
 terminal_spawn() {
   local mode="$1"; shift
   local esc; esc="$(osa_escape "$(build_exec_cmd "$@")")"
   if [ "$mode" = tab ]; then
-    osascript >/dev/null 2>&1 \
-      -e 'tell application "Terminal" to activate' \
-      -e 'tell application "System Events" to keystroke "t" using command down' \
-      -e "delay $TUIMUX_SPAWN_DELAY" \
-      -e "tell application \"Terminal\" to do script \"$esc\" in front window" \
-      && return 0
+    local pin=""
+    [ -n "${TUIMUX_SELF_WINID:-}" ] && pin="
+  try
+    set index of window id ${TUIMUX_SELF_WINID} to 1
+  end try"
+    osascript >/dev/null 2>&1 <<OSA && return 0
+tell application "Terminal"$pin
+  activate
+end tell
+tell application "System Events" to keystroke "t" using command down
+delay $TUIMUX_SPAWN_DELAY
+tell application "Terminal" to do script "$esc" in front window
+OSA
   fi
   osascript >/dev/null 2>&1 \
     -e 'tell application "Terminal" to activate' \
@@ -602,6 +682,21 @@ list_windows() {
     ghostty) ghostty_windows ;;
     *)       terminal_windows ;;
   esac
+}
+
+# Identifier of the dashboard's OWN window, captured once at startup (while it's
+# frontmost) and handed back to spawns as TUIMUX_SELF_WINID so "new tab" can target
+# this exact window. Only the terminals that hide the dashboard title need it:
+#   • Terminal.app → the AppleScript window id (its title isn't matchable later)
+#   • Linux/X11    → the focused X11 window id (xdotool), used by linux_raise_self
+# Ghostty matches by the visible "tuimux" title instead, so it needs nothing here.
+self_winid() {
+  if [ "$(os_kind)" = darwin ]; then
+    [ "$(term_kind)" = terminal ] || return 0
+    osascript -e 'tell application "Terminal" to id of front window' 2>/dev/null
+  elif [ "$(linux_display)" = x11 ] && have xdotool; then
+    xdotool getactivewindow 2>/dev/null
+  fi
 }
 
 # Focus an existing surface whose title matches the session name (surfaces are
@@ -844,7 +939,8 @@ doctor() {
 
 # ----- dispatch --------------------------------------------------------------
 case "${1:-}" in
-  here          ) shift; here_session "${1:-}" ;;
+  attach        ) shift; attach_here "${1:-}" ;;
+  detach        ) detach_here ;;
   init          ) shift; init_host "${1:-}" ;;
   doctor        ) doctor ;;
   # ----- backend called by the Textual UI -----
@@ -859,6 +955,7 @@ case "${1:-}" in
   __browse      ) shift; tmux_browse "${1:-}" ;;
   __openbrowse  ) shift; open_browse "${1:-}" ;;
   __windows     ) list_windows ;;
+  __selfwin     ) self_winid ;;
   __console     ) open_console ;;
   __awaketoggle ) shift; toggle_awake "${1:-}" >/dev/null 2>&1 ;;
   -h|--help|"" ) usage ;;

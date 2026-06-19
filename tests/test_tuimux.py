@@ -79,6 +79,24 @@ def test_tuimux_bin_is_absolute_or_name():
     assert got == "tuimux" or got.endswith("tuimux")
 
 
+# ---- CLI: attach / detach (replaced the old `here`) -------------------------
+def test_here_command_is_gone_and_usage_advertises_attach_detach():
+    r = subprocess.run(["bash", app.ENGINE, "here"], capture_output=True, text=True)
+    assert r.returncode == 1  # unknown command → usage + non-zero
+    out = r.stdout + r.stderr
+    assert "tuimux attach" in out and "tuimux detach" in out
+    assert "tuimux here" not in out
+
+
+def test_detach_outside_tmux_is_friendly_noop():
+    env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+    r = subprocess.run(
+        ["bash", app.ENGINE, "detach"], capture_output=True, text=True, env=env
+    )
+    assert r.returncode == 0  # not an error — just nothing to do
+    assert "not inside a tmux session" in (r.stdout + r.stderr).lower()
+
+
 # ---- probe parsing -----------------------------------------------------------
 CANNED = "\n".join(
     [
@@ -121,11 +139,43 @@ def test_probe_unreachable():
     assert info["reachable"] is False and info["busy"] is False
 
 
+def test_probe_keeps_raw_created_for_reconnect_identity():
+    with stub_engine(CANNED):
+        info = app.probe("host")
+    # the raw session_created epoch is preserved (not just the formatted uptime),
+    # so a reconnect can tell whether the very same session survived.
+    assert all("created" in s for s in info["sessions"])
+    assert {s["created"] for s in info["sessions"]} == {"0"}
+
+
+# ---- reconnect reconciliation -----------------------------------------------
+def _sess(name, created):
+    return {"name": name, "created": created}
+
+
+def test_reconcile_resumed_lost_and_quiet():
+    old = [_sess("a", "100"), _sess("b", "200")]
+    # a survived (same created), b is gone, c is brand new
+    new = [_sess("a", "100"), _sess("c", "300")]
+    assert app._reconcile_sessions(old, new) == {"a": "resumed", "b": "lost"}
+    # same name but a new created → the old instance was lost (tmux restarted it)
+    assert app._reconcile_sessions([_sess("a", "100")], [_sess("a", "999")]) == {
+        "a": "lost"
+    }
+    # everything survived → all resumed (the happy reconnect case)
+    assert app._reconcile_sessions(old, old) == {"a": "resumed", "b": "resumed"}
+    assert app._reconcile_sessions([], []) == {}
+
+
 # ---- view-model / rendering --------------------------------------------------
-def _view_for(hosts, results):
+def _view_for(hosts, results, snap=None, reconcile=None):
     a = app.Tuimux()
     a._hosts = hosts
     a._results = results
+    if snap:
+        a._snap = snap
+    if reconcile:
+        a._reconcile = reconcile
     return a._view()
 
 
@@ -270,6 +320,96 @@ def test_view_row_meta_actions():
     assert rows[-1][1]["session"] == "__NEW__"
 
 
+# ---- offline "paused" sessions + reconnect verdicts -------------------------
+_OPEN_IN = app._COLS.index("open_in")
+
+
+def _snap_session(name, created="100", state="running"):
+    return {
+        "name": name,
+        "auto": name,
+        "attached": False,
+        "dir": "~/code",
+        "tabs": f"1  {state}",
+        "open_in": "detached",
+        "state": state,
+        "created": created,
+        "uptime": "1h",
+        "agent": False,
+    }
+
+
+def test_offline_host_shows_remembered_sessions_as_unreachable():
+    hosts = [("off", False, "offline", "2h ago", "compute")]
+    base = {"reachable": False, "busy": False, "notmux": False, "awake": False}
+    results = {"off": {**base, "sessions": [], "lastseen": "2h ago"}}
+    snap = {"off": [_snap_session("build"), _snap_session("api")]}
+    rows = _view_for(hosts, results, snap=snap)
+    # machine row + its two remembered sessions (no "+ new" for an offline host)
+    assert [m["action"] for _, m in rows] == ["none", "none", "none"]
+    sess = rows[1:]
+    assert {_cell_text(c[0]).strip() for c, _ in sess} == {"build", "api"}
+    # each remembered session is flagged unreachable, and nothing is attachable
+    assert all(_cell_text(c[_OPEN_IN]) == "unreachable" for c, _ in sess)
+    assert all(m["session"] in ("build", "api") for _, m in sess)
+
+
+def test_offline_host_without_snapshot_shows_only_the_machine_row():
+    # no remembered sessions (e.g. never probed before going down) → unchanged
+    hosts = [("off", False, "offline", "2h ago", "compute")]
+    base = {"reachable": False, "busy": False, "notmux": False, "awake": False}
+    results = {"off": {**base, "sessions": [], "lastseen": "2h ago"}}
+    rows = _view_for(hosts, results)
+    assert len(rows) == 1 and _cell_text(rows[0][0][1]) == "offline"
+
+
+def test_reconnect_marks_resumed_and_lost():
+    hosts = [("rem", False, "online", "", "compute")]
+    live = _snap_session("build", created="100")
+    live.update(auto="build", attached=False)
+    results = {
+        "rem": {
+            "reachable": True,
+            "busy": False,
+            "notmux": False,
+            "awake": False,
+            "sessions": [live],
+        }
+    }
+    # "build" survived (still live); "gone" did not come back
+    reconcile = {"rem": (app.time.monotonic(), {"build": "resumed", "gone": "lost"})}
+    rows = _view_for(hosts, results, reconcile=reconcile)
+    texts = [_cell_text(c[0]).strip() for c, _ in rows]
+    # the surviving session carries a "resumed" marker in its OPEN IN cell
+    build_row = next(c for c, _ in rows if _cell_text(c[0]).strip() == "build")
+    assert "resumed" in _cell_text(build_row[_OPEN_IN])
+    # the lost session gets its own transient row that isn't attachable
+    lost = next((c, m) for c, m in rows if _cell_text(c[0]).strip() == "gone")
+    assert _cell_text(lost[0][_OPEN_IN]) == "lost — not restored"
+    assert lost[1]["action"] == "none"
+    assert "gone" in texts
+
+
+def test_reconnect_verdicts_age_out_after_ttl():
+    hosts = [("rem", False, "online", "", "compute")]
+    live = _snap_session("build", created="100")
+    results = {
+        "rem": {
+            "reachable": True,
+            "busy": False,
+            "notmux": False,
+            "awake": False,
+            "sessions": [live],
+        }
+    }
+    stale = app.time.monotonic() - app.RECONCILE_TTL - 1
+    reconcile = {"rem": (stale, {"build": "resumed", "gone": "lost"})}
+    rows = _view_for(hosts, results, reconcile=reconcile)
+    # past the TTL: no "resumed" badge, no transient "lost" row
+    assert not any("resumed" in _cell_text(c[_OPEN_IN]) for c, _ in rows)
+    assert not any(_cell_text(c[0]).strip() == "gone" for c, _ in rows)
+
+
 # ---- window location ("OPEN IN") --------------------------------------------
 def test_window_label_this_vs_other():
     a = app.Tuimux()
@@ -285,11 +425,15 @@ def test_open_in_cell():
     a = app.Tuimux()
     a._windows = [("1", "tuimux"), ("1", "main · zsh"), ("2", "build · vim")]
     a._self_win = "1"
-    assert a._open_in_cell({"name": "x", "open_in": "detached"}) == ("detached", "dim")
-    assert a._open_in_cell({"name": "main", "open_in": "ghostty"})[0] == "this window"
-    assert a._open_in_cell({"name": "build", "open_in": "ghostty"})[0] == "other window"
+
+    def cell(s):
+        return a._open_in_cell(s, a._window_label(s["name"]))
+
+    assert cell({"name": "x", "open_in": "detached"}) == ("detached", "dim")
+    assert cell({"name": "main", "open_in": "ghostty"})[0] == "this window"
+    assert cell({"name": "build", "open_in": "ghostty"})[0] == "other window"
     # attached but no local tab found → fall back to the terminal type
-    assert a._open_in_cell({"name": "zzz", "open_in": "ghostty"})[0] == "ghostty"
+    assert cell({"name": "zzz", "open_in": "ghostty"})[0] == "ghostty"
 
 
 # ---- Linux spawn command builder (engine.sh) --------------------------------
@@ -354,6 +498,75 @@ def test_linux_wayland_auto_falls_through_to_new_surface():
     )
     assert "[dry-run] gnome-terminal --tab -- bash" in out
     assert "__attach macmini happy-curie attach" in out
+
+
+# ---- new-tab targeting (engine.sh) ------------------------------------------
+# osascript can't run headless, so we source the engine and stub it. The macOS
+# spawners feed their AppleScript to osascript on stdin (tab) or via -e (window);
+# the stub appends stdin to a capture file so we can assert what each path builds.
+def _engine_func(call, env=None, stubs=""):
+    e = {**os.environ}
+    if env:
+        e.update(env)
+    script = (
+        f"source {app.ENGINE} __login >/dev/null 2>&1; "
+        "osascript(){ return 0; }; "  # never drive the GUI in tests
+        f"{stubs}{call}"
+    )
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env=e,
+        stdin=subprocess.DEVNULL,
+    ).stdout
+
+
+def test_ghostty_new_tab_targets_dashboard_window():
+    # Ghostty finds its window by the visible "tuimux" title: a new *tab* raises it
+    # first; a new *window* does not.
+    stubs = "ghostty_raise_self(){ echo RAISED_SELF; }; "
+    tab = _engine_func("ghostty_spawn t bash x __attach h s attach", stubs=stubs)
+    win = _engine_func("ghostty_spawn n bash x __attach h s attach", stubs=stubs)
+    assert "RAISED_SELF" in tab  # new tab → opened into the dashboard window
+    assert "RAISED_SELF" not in win  # new window → a brand-new window, left alone
+
+
+def test_terminal_new_tab_pins_dashboard_window_id():
+    # Terminal.app hides our title, so a new *tab* pins the dashboard by the window
+    # id we captured at startup (set index … to 1) before Cmd-T; a *window* doesn't.
+    with tempfile.TemporaryDirectory() as d:
+        cap = os.path.join(d, "cap")
+        stubs = (
+            "build_exec_cmd(){ echo CMD; }; osa_escape(){ printf '%s' \"$1\"; }; "
+            f"osascript(){{ cat >> {cap} 2>/dev/null; return 0; }}; "
+        )
+        env = {"TUIMUX_SELF_WINID": "4242"}
+        open(cap, "w").close()
+        _engine_func("terminal_spawn tab bash x", env=env, stubs=stubs)
+        tab_script = open(cap).read()
+        open(cap, "w").close()
+        _engine_func("terminal_spawn window bash x", env=env, stubs=stubs)
+        win_script = open(cap).read()
+    assert "set index of window id 4242 to 1" in tab_script
+    assert 'keystroke "t"' in tab_script  # the new tab itself
+    assert "window id 4242" not in win_script  # a window is brand-new, not pinned
+
+
+def test_terminal_new_tab_without_winid_does_not_pin():
+    # No captured id (e.g. Ghostty/Linux, or capture failed) → no pin, just front
+    # window — degrades to the old behaviour, never errors.
+    with tempfile.TemporaryDirectory() as d:
+        cap = os.path.join(d, "cap")
+        stubs = (
+            "build_exec_cmd(){ echo CMD; }; osa_escape(){ printf '%s' \"$1\"; }; "
+            f"osascript(){{ cat >> {cap} 2>/dev/null; return 0; }}; "
+        )
+        open(cap, "w").close()
+        _engine_func("terminal_spawn tab bash x", stubs=stubs)  # no TUIMUX_SELF_WINID
+        tab_script = open(cap).read()
+    assert "set index of window id" not in tab_script
+    assert 'keystroke "t"' in tab_script
 
 
 def test_linux_list_windows_x11_keeps_only_terminals():
