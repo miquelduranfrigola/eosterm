@@ -668,6 +668,34 @@ def test_open_in_cell():
         "this window",
         "2 clients",
     )
+    # attached but no client line (e.g. switch-client'd away): host tracks
+    # `attached`, so it stays "on host" rather than disagreeing with the bold name
+    assert cell({"name": "zzz", "attached": True, "nclients": 0}) == ("—", "on host")
+
+
+def test_disposable_tmux_session():
+    orig = app.subprocess.run
+    try:
+        # 1 window / 1 pane / 1 client → disposable, returns the name
+        app.subprocess.run = lambda *a, **k: SimpleNamespace(
+            stdout="dev\t1\t1\t1\n", returncode=0
+        )
+        assert app._disposable_tmux_session() == "dev"
+        # extra window → not disposable
+        app.subprocess.run = lambda *a, **k: SimpleNamespace(
+            stdout="dev\t2\t1\t1\n", returncode=0
+        )
+        assert app._disposable_tmux_session() is None
+        # a second client → not disposable (someone else is attached)
+        app.subprocess.run = lambda *a, **k: SimpleNamespace(
+            stdout="dev\t1\t1\t2\n", returncode=0
+        )
+        assert app._disposable_tmux_session() is None
+        # malformed / empty output → safely None, never raises
+        app.subprocess.run = lambda *a, **k: SimpleNamespace(stdout="\n", returncode=0)
+        assert app._disposable_tmux_session() is None
+    finally:
+        app.subprocess.run = orig
 
 
 # ---- run(): tuimux must never nest inside tmux ------------------------------
