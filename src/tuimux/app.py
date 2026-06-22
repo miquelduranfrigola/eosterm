@@ -537,7 +537,10 @@ class Tuimux(App):
             ("UPTIME", "uptime", 7),
             ("FOLDER", "folder", 20),
             ("TABS", "tabs", 12),
-            ("OPEN IN", "open", 24),
+            # wide enough for "other window · NN clients"; the transient "resumed"
+            # marker can append a little more, but it only lands on just-reconnected
+            # sessions, which are detached (0 clients) → short, so it fits in practice.
+            ("OPEN IN", "open", 26),
             ("AGENT", "agent", 10),
         ):
             t.add_column(col, key=key, width=w)
@@ -713,13 +716,14 @@ class Tuimux(App):
         else:
             local = ("—", "dim")
         n = s.get("nclients", 0)
-        host = (
-            ("detached", "dim")
-            if n == 0
-            else ("on host", REMOTE)
-            if n == 1
-            else (f"{n} clients", REMOTE)
-        )
+        # The host axis reads attachment the same way the NAME does (s["attached"]),
+        # so the two can never disagree — e.g. a client that switch-client'd away can
+        # leave session_attached set with no list-clients line; trust attached here
+        # and let nclients only split one client ("on host") from many ("N clients").
+        if s.get("attached") or n:
+            host = ("on host", REMOTE) if n <= 1 else (f"{n} clients", REMOTE)
+        else:
+            host = ("detached", "dim")
         return [local, (" · ", "dim"), host]
 
     # Build the table as plain data — a list of (cells, meta) rows — so we can
@@ -1081,7 +1085,11 @@ def run():
         except OSError:
             ok = False
         if ok:
-            return  # this terminal is now detached and (re)launching the dashboard
+            # detach-client returns 0 once the detach is queued — before the -E
+            # command execs — so this confirms the handoff started, not that the
+            # dashboard came up. A broken tuimux_bin() would leave a bare shell;
+            # that's inherent to -E and the same failure you'd get launching by hand.
+            return
         raise SystemExit(
             "Don't run tuimux inside tmux — open it in a plain terminal tab."
         )
