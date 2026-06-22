@@ -56,12 +56,20 @@ def test_uptime_buckets():
     assert app._uptime(now - 200000).endswith("d")
 
 
-def test_map_term():
-    assert app._map_term("xterm-ghostty") == "ghostty"
-    assert app._map_term("xterm-kitty") == "kitty"
-    assert app._map_term("screen.xterm") == "tmux"
-    assert app._map_term("xterm-256color") == "term"
-    assert app._map_term("") == "-"
+def test_probe_counts_clients_per_session():
+    # two clients attached to the same session → nclients == 2
+    canned = "\n".join(
+        [
+            "OK",
+            "S|main|1|1|/home/u|zsh|100",
+            "L|main|xterm-ghostty",
+            "L|main|xterm-256color",
+        ]
+    )
+    with stub_engine(canned):
+        info = app.probe("host")
+    main = info["sessions"][0]
+    assert main["attached"] is True and main["nclients"] == 2
 
 
 def test_auto_name():
@@ -310,9 +318,9 @@ def test_probe_parses_sessions_awake_and_agent():
     assert [s["auto"] for s in info["sessions"]] == ["cl", "main"]
     cl, main = info["sessions"]
     assert cl["agent"] is True and cl["state"] == "waiting"
-    assert cl["open_in"] == "detached"  # not attached
+    assert cl["attached"] is False and cl["nclients"] == 0  # not attached
     assert main["agent"] is False and main["state"] == "idle"  # zsh → idle
-    assert main["open_in"] == "ghostty"  # attached + ghostty client
+    assert main["attached"] is True and main["nclients"] == 1  # one client on host
 
 
 def test_probe_timeout_marks_busy_not_failed():
@@ -437,9 +445,9 @@ def test_view_bold_only_on_identifiers():
                     "name": "a",
                     "auto": "att",
                     "attached": True,
+                    "nclients": 1,
                     "dir": "~",
                     "tabs": "1",
-                    "open_in": "ghostty",
                     "state": "running",
                     "uptime": "1h",
                     "agent": False,
@@ -448,9 +456,9 @@ def test_view_bold_only_on_identifiers():
                     "name": "b",
                     "auto": "det",
                     "attached": False,
+                    "nclients": 0,
                     "dir": "~",
                     "tabs": "1",
-                    "open_in": "detached",
                     "state": "idle",
                     "uptime": "1h",
                     "agent": False,
@@ -492,9 +500,9 @@ def test_view_row_meta_actions():
                     "name": "s1",
                     "auto": "s1",
                     "attached": False,
+                    "nclients": 0,
                     "dir": "~",
                     "tabs": "1",
-                    "open_in": "detached",
                     "state": "idle",
                     "uptime": "1h",
                     "agent": False,
@@ -517,9 +525,9 @@ def _snap_session(name, created="100", state="running"):
         "name": name,
         "auto": name,
         "attached": False,
+        "nclients": 0,
         "dir": "~/code",
         "tabs": f"1  {state}",
-        "open_in": "detached",
         "state": state,
         "created": created,
         "uptime": "1h",
@@ -599,14 +607,31 @@ def test_reconnect_verdicts_age_out_after_ttl():
 
 
 # ---- window location ("OPEN IN") --------------------------------------------
-def test_window_label_this_vs_other():
+def test_window_locs_this_vs_other():
     a = app.Tuimux()
     # tuimux + "main" share window 1; "build" is alone in window 2
     a._windows = [("1", "tuimux"), ("1", "main · zsh"), ("2", "build · vim")]
     a._self_win = "1"
-    assert a._window_label("main") == "this window"
-    assert a._window_label("build") == "other window"
-    assert a._window_label("missing") is None  # no matching tab
+    assert a._window_locs("main") == ["this window"]
+    assert a._window_locs("build") == ["other window"]
+    assert a._window_locs("missing") == []  # no matching tab
+
+
+def test_window_locs_handles_terminal_app_decorations():
+    # Terminal.app decorates the "#S · #W" title tmux sets into
+    # "<login> — <session> · <window> — <proc> — <WxH>". _title_parts splits on the
+    # em-dash so the decorations don't defeat the match. (Terminal.app opens each
+    # session as its own window, so they read "other window", never "this window".)
+    a = app.Tuimux()
+    a._windows = [
+        ("1", "miquel — tuimux — -zsh — 80×24"),  # the dashboard itself
+        ("2", "miquel — main · zsh — tmux — 80×24"),
+        ("3", "miquel — build · vim — tmux — 120×40"),
+    ]
+    a._self_win = "1"
+    assert a._window_locs("main") == ["other window"]
+    assert a._window_locs("build") == ["other window"]
+    assert a._window_locs("missing") == []
 
 
 def test_open_in_cell():
@@ -615,13 +640,118 @@ def test_open_in_cell():
     a._self_win = "1"
 
     def cell(s):
-        return a._open_in_cell(s, a._window_label(s["name"]))
+        # collapse to "local · host" words, dropping the dim separator/styles
+        segs = a._open_in_cell(s, a._window_locs(s["name"]))
+        return (segs[0][0], segs[-1][0])
 
-    assert cell({"name": "x", "open_in": "detached"}) == ("detached", "dim")
-    assert cell({"name": "main", "open_in": "ghostty"})[0] == "this window"
-    assert cell({"name": "build", "open_in": "ghostty"})[0] == "other window"
-    # attached but no local tab found → fall back to the terminal type
-    assert cell({"name": "zzz", "open_in": "ghostty"})[0] == "ghostty"
+    # nowhere → "— · detached"
+    assert cell({"name": "x", "attached": False, "nclients": 0}) == ("—", "detached")
+    # open here, one client on host
+    assert cell({"name": "main", "attached": True, "nclients": 1}) == (
+        "this window",
+        "on host",
+    )
+    # open in another local window
+    assert cell({"name": "build", "attached": True, "nclients": 1}) == (
+        "other window",
+        "on host",
+    )
+    # attached on host but no local tab here → "— · on host"
+    assert cell({"name": "zzz", "attached": True, "nclients": 1}) == ("—", "on host")
+    # stale local tab: open here but detached on the host
+    assert cell({"name": "main", "attached": False, "nclients": 0}) == (
+        "this window",
+        "detached",
+    )
+    # open here and also attached elsewhere → "this window · 2 clients"
+    assert cell({"name": "main", "attached": True, "nclients": 2}) == (
+        "this window",
+        "2 clients",
+    )
+
+
+# ---- run(): tuimux must never nest inside tmux ------------------------------
+@contextlib.contextmanager
+def _patched_run(returncode, tmux, session_info="dev\t2\t1\t1"):
+    """Stub subprocess.run + Tuimux + $TMUX so run() can be exercised offline.
+
+    `session_info` is what `tmux display-message` returns for the disposable
+    check (name\\twindows\\tpanes\\tclients); the default (2 windows) is NOT
+    disposable. Yields (calls, launched): the tmux commands issued, and whether
+    the dashboard was started in-process."""
+    calls, launched = [], []
+    orig_run, orig_tuimux = app.subprocess.run, app.Tuimux
+    had_tmux = "TMUX" in os.environ
+    prev_tmux = os.environ.get("TMUX")
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if "display-message" in cmd:
+            return SimpleNamespace(stdout=session_info + "\n", returncode=0)
+        return SimpleNamespace(returncode=returncode, stdout="")
+
+    app.subprocess.run = fake_run
+    app.Tuimux = lambda: SimpleNamespace(run=lambda: launched.append(True))
+    if tmux is None:
+        os.environ.pop("TMUX", None)
+    else:
+        os.environ["TMUX"] = tmux
+    try:
+        yield calls, launched
+    finally:
+        app.subprocess.run, app.Tuimux = orig_run, orig_tuimux
+        if had_tmux:
+            os.environ["TMUX"] = prev_tmux
+        else:
+            os.environ.pop("TMUX", None)
+
+
+def _detach_cmd(calls):
+    return next(c for c in calls if c[:2] == ["tmux", "detach-client"])
+
+
+def test_run_inside_tmux_detaches_and_relaunches_same_window():
+    # 2-window session → NOT disposable → detach only, never killed
+    with _patched_run(returncode=0, tmux="/tmp/tmux-501/default,9,0") as (calls, launched):
+        app.run()
+    # never starts the dashboard in this (inside-tmux) process …
+    assert launched == []
+    # … instead it detaches this client and hands the window off to a fresh tuimux
+    detach = _detach_cmd(calls)
+    assert detach[2] == "-E"
+    handoff = detach[3]
+    assert "TUIMUX_NO_AUTOTMUX=1" in handoff and "exec" in handoff
+    assert "kill-session" not in handoff  # preserved, not killed
+
+
+def test_run_inside_tmux_kills_disposable_session():
+    # 1 window / 1 pane / 1 client → a throwaway autostart shell → cleaned up
+    with _patched_run(
+        returncode=0, tmux="x", session_info="happy-curie\t1\t1\t1"
+    ) as (calls, launched):
+        app.run()
+    assert launched == []
+    handoff = _detach_cmd(calls)[3]
+    # kills the throwaway session first, then relaunches the dashboard
+    assert handoff.index("kill-session -t happy-curie") < handoff.index("exec")
+    assert "TUIMUX_NO_AUTOTMUX=1" in handoff
+
+
+def test_run_inside_tmux_falls_back_when_detach_fails():
+    with _patched_run(returncode=1, tmux="x") as (_calls, launched):
+        try:
+            app.run()
+        except SystemExit as e:
+            assert "inside tmux" in str(e)
+        else:
+            raise AssertionError("expected SystemExit when detach-client fails")
+    assert launched == []  # didn't start the app inside tmux either
+
+
+def test_run_outside_tmux_launches_dashboard():
+    with _patched_run(returncode=0, tmux=None) as (calls, launched):
+        app.run()
+    assert launched == [True] and calls == []  # no tmux handoff needed
 
 
 # ---- Linux spawn command builder (engine.sh) --------------------------------
