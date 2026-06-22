@@ -8,6 +8,7 @@ purely the front-end, calling it for data and actions.
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -160,18 +161,6 @@ def _title_parts(title):
     return [p.strip() for p in title.split("—")]
 
 
-def _map_term(t):
-    tl = (t or "").lower()
-    for k in ("ghostty", "kitty", "alacritty", "wezterm"):
-        if k in tl:
-            return k
-    if tl.startswith(("screen", "tmux")):
-        return "tmux"
-    if tl.startswith(("xterm", "vt")) or tl == "linux":
-        return "term"
-    return t or "-"
-
-
 def _auto_name(name, dird, is_agent, cmd):
     if not name.isdigit():  # docker/manual name → keep it
         return name or "?"
@@ -221,7 +210,7 @@ def probe(host):
             elif t == "W":
                 W.setdefault(p[1], []).append((p[2], p[3], p[4] == "1"))
             elif t == "L":
-                L[p[1]] = p[2]
+                L.setdefault(p[1], []).append(p[2])  # one entry per attached client
             elif t == "A":
                 A[p[1]] = p[2]
             elif t == "C":
@@ -241,7 +230,6 @@ def probe(host):
         )
         if is_agent and re.match(r"^[0-9][0-9.]*$", active or ""):
             active = "claude"
-        client = L.get(name)
         state = (
             (A.get(name) or "running")
             if is_agent
@@ -252,11 +240,12 @@ def probe(host):
                 "name": name,
                 "auto": _auto_name(name, dird, is_agent, s["cmd"]),
                 "attached": s["attached"],
+                # how many tmux clients hold this session on its host — drives the
+                # "on host"/"N clients"/"detached" half of the OPEN IN cell. This is
+                # independent of whether a tab is open on *this* Mac (see _window_locs).
+                "nclients": len(L.get(name, [])),
                 "dir": dird,
                 "tabs": f"{count}  {active}",
-                "open_in": _map_term(client)
-                if (s["attached"] and client)
-                else "detached",
                 "state": state,
                 "uptime": _uptime(s["created"]),
                 "created": s["created"],  # raw epoch — identity key for reconnect
@@ -507,7 +496,7 @@ class Tuimux(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical(id="table-wrap") as w:
-            w.border_title = "✦ tuimux"
+            w.border_title = "tuimux by Ersilia"
             yield SessionTable(cursor_type="row", zebra_stripes=False)
         yield Footer()
 
@@ -548,7 +537,7 @@ class Tuimux(App):
             ("UPTIME", "uptime", 7),
             ("FOLDER", "folder", 20),
             ("TABS", "tabs", 12),
-            ("OPEN IN", "open", 13),
+            ("OPEN IN", "open", 24),
             ("AGENT", "agent", 10),
         ):
             t.add_column(col, key=key, width=w)
@@ -688,30 +677,50 @@ class Tuimux(App):
         self._self_win = self_win
         self._render()
 
-    def _window_label(self, session_name):
-        """Where this session's Ghostty tab lives, or None if not found locally.
+    def _window_locs(self, session_name):
+        """Labels for every terminal window *on this Mac* showing this session.
 
         tuimux-opened surfaces are titled "<session> · <window>" (tmux set-titles),
         so we match the part before " · " against the session name — per title
-        component, so Terminal.app's "<login> — …" decorations don't get in the way."""
+        component, so Terminal.app's "<login> — …" decorations don't get in the way.
+        Returns a list (a session can be open in more than one local window); empty
+        if it isn't open anywhere on this Mac."""
+        locs = []
         for idx, title in self._windows:
             if any(
                 p.split(" · ", 1)[0].strip() == session_name
                 for p in _title_parts(title)
             ):
                 if self._self_win is not None and idx == self._self_win:
-                    return "this window"
-                return "other window"
-        return None
+                    locs.append("this window")
+                else:
+                    locs.append("other window")
+        return locs
 
-    def _open_in_cell(self, s, loc):
-        """OPEN IN segment: which window the session is open in, else the
-        attaching terminal type, else detached."""
-        if s["open_in"] == "detached":
-            return ("detached", "dim")
-        if loc:
-            return (loc, LOCAL if loc == "this window" else REMOTE)
-        return (s["open_in"], REMOTE)  # attached, but tab not found locally
+    def _open_in_cell(self, s, locs):
+        """OPEN IN as two tokens, "<local> · <host>":
+
+          local — where it's open on THIS Mac: this window / other window / — (none)
+          host  — its live attachment on the host where it runs: on host (1 client) /
+                  N clients (more) / detached (none)
+
+        The two are independent: a stale local tab reads "this window · detached",
+        and a session attached only from elsewhere reads "— · on host"."""
+        if "this window" in locs:
+            local = ("this window", LOCAL)
+        elif locs:
+            local = ("other window", LOCAL)
+        else:
+            local = ("—", "dim")
+        n = s.get("nclients", 0)
+        host = (
+            ("detached", "dim")
+            if n == 0
+            else ("on host", REMOTE)
+            if n == 1
+            else (f"{n} clients", REMOTE)
+        )
+        return [local, (" · ", "dim"), host]
 
     # Build the table as plain data — a list of (cells, meta) rows — so we can
     # diff cheaply and only repaint when something actually changed.
@@ -829,14 +838,14 @@ class Tuimux(App):
                     # the same signal that drives the OPEN IN cell. If we can't
                     # pin down the tab, the menu honestly offers a new tab
                     # instead of promising focus the engine can't deliver.
-                    loc = self._window_label(s["name"])
+                    locs = self._window_locs(s["name"])
                     rows.append(
                         _row(
                             {
                                 "host": host,
                                 "session": s["name"],
                                 "action": "attach",
-                                "open": loc is not None,
+                                "open": bool(locs),
                             },
                             name=(
                                 ("  ", ""),
@@ -846,7 +855,7 @@ class Tuimux(App):
                             uptime=((s["uptime"], "dim"),),
                             folder=((s["dir"], CYAN),),
                             tabs=((s["tabs"], "dim"),),
-                            open_in=(self._open_in_cell(s, loc),)
+                            open_in=tuple(self._open_in_cell(s, locs))
                             + (
                                 (("  resumed", GREEN),)
                                 if verdicts.get(s["name"]) == "resumed"
@@ -1027,9 +1036,52 @@ class Tuimux(App):
             self._act(["__awaketoggle", m["host"]])
 
 
+def _disposable_tmux_session():
+    """Name of the current tmux session iff it's a throwaway worth removing
+    rather than leaving detached: a single-pane, single-window session with no
+    other client attached — i.e. the kind `autostart` spins up for a fresh
+    terminal. Anything with more structure (extra windows/panes, or a client
+    attached elsewhere) returns None and is only ever detached, never killed, so
+    real work is never destroyed."""
+    fmt = "#{session_name}\t#{session_windows}\t#{window_panes}\t#{session_attached}"
+    try:
+        out = subprocess.run(
+            ["tmux", "display-message", "-p", fmt],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except OSError:
+        return None
+    parts = out.split("\t")
+    # 1 window, 1 pane, exactly this one client → safe to discard
+    return parts[0] if len(parts) == 4 and parts[1:] == ["1", "1", "1"] else None
+
+
 def run():
-    """Entry point: refuse to nest inside tmux, then launch the dashboard."""
+    """Entry point: launch the dashboard. tuimux must run *outside* tmux (it
+    drives tmux; nesting it inside a session is meaningless). So if you type
+    `tuimux` from within a tmux client, detach that client and relaunch the
+    dashboard in the SAME terminal window: `detach-client -E` replaces the
+    client with our command. If the session we were in is a throwaway (a lone
+    autostart shell), the relaunch also kills it — running from the freed
+    terminal, so it's safe — instead of leaving it cluttering the dashboard.
+    Falls back to a plain message if the handoff can't be performed."""
     if os.environ.get("TMUX"):
+        sess = _disposable_tmux_session()
+        cleanup = f"tmux kill-session -t {shlex.quote(sess)} 2>/dev/null; " if sess else ""
+        relaunch = f"{cleanup}TUIMUX_NO_AUTOTMUX=1 exec {shlex.quote(tuimux_bin())}"
+        try:
+            ok = (
+                subprocess.run(
+                    ["tmux", "detach-client", "-E", relaunch],
+                    stderr=subprocess.DEVNULL,
+                ).returncode
+                == 0
+            )
+        except OSError:
+            ok = False
+        if ok:
+            return  # this terminal is now detached and (re)launching the dashboard
         raise SystemExit(
             "Don't run tuimux inside tmux — open it in a plain terminal tab."
         )
