@@ -1060,6 +1060,163 @@ def test_peek_with_missing_args_is_an_empty_noop():
     assert r.stdout.strip() == ""
 
 
+# ---- per-host logins + org fleet (engine.sh) --------------------------------
+# A fake `tailscale` (function on PATH-less shell) emitting a canned multi-owner
+# status, so discovery/hosts_data can be exercised without a real tailnet. Self is
+# me@ at 100.0.0.1; herbert/curie are arnau@; phone is an iOS consumer.
+_TS_STUB = r"""tailscale(){ case "$1" in
+  ip) echo 100.0.0.1 ;;
+  status) cat <<'EOF'
+100.0.0.1  mybox     me@      linux  -
+100.0.0.2  herbert   arnau@   linux  -
+100.0.0.3  phone     me@      iOS    -
+100.0.0.4  curie     arnau@   macOS  offline, last seen 2h ago
+EOF
+  ;; esac; }; """
+
+
+def _engine_eval(call, env=None, scope=None):
+    """Source the engine (with a stubbed tailscale) and run a shell `call`,
+    returning its stdout. CONFIG points at /dev/null so a real user config can't
+    leak into the test."""
+    e = {**os.environ, "TUIMUX_CONFIG": "/dev/null"}
+    e.pop("TUIMUX_LOGINS", None)
+    if scope:
+        e["TUIMUX_SCOPE"] = scope
+    if env:
+        e.update(env)
+    script = f"source {app.ENGINE} __login >/dev/null 2>&1; {_TS_STUB} {call}"
+    return subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, env=e
+    ).stdout
+
+
+def _engine_out(args, env=None):
+    e = {**os.environ, "TUIMUX_CONFIG": "/dev/null"}
+    e.pop("TUIMUX_LOGINS", None)
+    if env:
+        e.update(env)
+    return subprocess.run(
+        ["bash", app.ENGINE, *args], capture_output=True, text=True, env=e
+    ).stdout
+
+
+def test_login_for_resolves_mapping_else_default():
+    env = {"TUIMUX_LOGINS": "herbert=mduran nebula=arnaul", "USER": "miquel"}
+    assert _engine_out(["__loginfor", "herbert"], env).strip() == "mduran"
+    assert _engine_out(["__loginfor", "nebula"], env).strip() == "arnaul"
+    assert _engine_out(["__loginfor", "macmini"], env).strip() == "miquel"  # fallback
+
+
+def test_login_cli_set_list_rm_and_validation():
+    with tempfile.TemporaryDirectory() as d:
+        cfg = os.path.join(d, "config")
+        env = {"TUIMUX_CONFIG": cfg, "USER": "miquel"}
+        _engine_out(["login", "herbert", "mduran"], env)
+        _engine_out(["login", "nebula", "mduran"], env)
+        txt = Path(cfg).read_text()
+        assert txt.count("TUIMUX_LOGINS=") == 1  # one line, never duplicated
+        assert "herbert=mduran" in txt and "nebula=mduran" in txt
+        # replacing a host rewrites its token in place, still one line
+        _engine_out(["login", "herbert", "mfrigola"], env)
+        txt = Path(cfg).read_text()
+        assert txt.count("TUIMUX_LOGINS=") == 1
+        assert "herbert=mfrigola" in txt and "herbert=mduran" not in txt
+        # list shows the current mappings
+        listing = _engine_out(["login"], env)
+        assert "herbert" in listing and "mfrigola" in listing
+        # --rm drops just that one
+        _engine_out(["login", "--rm", "herbert"], env)
+        txt = Path(cfg).read_text()
+        assert "herbert=" not in txt and "nebula=mduran" in txt
+        # an invalid token is rejected and leaves the config untouched
+        before = Path(cfg).read_text()
+        r = subprocess.run(
+            ["bash", app.ENGINE, "login", "foo", "bad user"],
+            capture_output=True, text=True, env={**os.environ, **env},
+        )
+        assert r.returncode != 0
+        assert Path(cfg).read_text() == before
+
+
+def test_discover_scope_mine_vs_org():
+    # mine: self + same-owner online peers (phone). org: all online peers, any
+    # owner (+ herbert). curie is offline → never in discover (online-only).
+    mine = _engine_eval("discover_hosts", scope="mine").split()
+    org = _engine_eval("discover_hosts", scope="org").split()
+    assert mine == ["mybox", "phone"]
+    assert set(org) == {"mybox", "herbert", "phone"}
+    assert "curie" not in org
+
+
+def test_discover_includes_mapped_foreign_host():
+    # A teammate-owned host you've mapped a login for shows up even in mine scope.
+    mine = _engine_eval(
+        "discover_hosts", env={"TUIMUX_LOGINS": "herbert=mduran"}, scope="mine"
+    ).split()
+    assert "herbert" in mine
+
+
+def test_hosts_data_columns_owner_mapping_probe():
+    rows = [
+        ln.split("\t")
+        for ln in _engine_eval("hosts_data", scope="org").splitlines()
+    ]
+    by = {r[0]: r for r in rows}
+    # name islocal status lastseen kind owner mapping probe
+    assert by["mybox"][1] == "1" and by["mybox"][5] == "me" and by["mybox"][7] == "1"
+    assert by["phone"][4] == "consumer"
+    # foreign, unmapped → listed but not probed
+    assert by["herbert"][5] == "arnau" and by["herbert"][6] == "" and by["herbert"][7] == "0"
+    assert by["curie"][2] == "offline" and by["curie"][7] == "0"
+    # mapping a foreign host flips it to probe=1 and records the login
+    rows2 = [
+        ln.split("\t")
+        for ln in _engine_eval(
+            "hosts_data", env={"TUIMUX_LOGINS": "herbert=mduran"}, scope="org"
+        ).splitlines()
+    ]
+    h = {r[0]: r for r in rows2}["herbert"]
+    assert h[6] == "mduran" and h[7] == "1"
+
+
+def _view_org(hosts, results):
+    a = app.Tuimux()
+    a._scope = "org"
+    a._hosts = hosts
+    a._results = results
+    return a._view()
+
+
+def test_view_org_shows_owner_and_unmapped_login_hint():
+    base = {"reachable": False, "busy": False, "notmux": False, "awake": False}
+    hosts = [
+        ("mybox", True, "online", "", "compute", "miquel", "", True),
+        ("herbert", False, "online", "", "compute", "arnau", "", False),
+        ("pujarnol", False, "online", "", "compute", "gemma", "mduran", True),
+    ]
+    results = {
+        "mybox": {**base, "reachable": True, "sessions": []},
+        "pujarnol": {**base, "reachable": True, "sessions": []},
+    }
+    rows = _view_org(hosts, results)
+    # owner tag appears on remote machines in org view
+    herbert = next(c for c, _ in rows if "herbert" in _cell_text(c[0]))
+    assert "arnau" in _cell_text(herbert[0])  # owner shown
+    assert "no login" in _cell_text(herbert[1])  # unmapped → not probed
+    # a mapped host shows the login it connects as
+    puj = next(c for c, _ in rows if "pujarnol" in _cell_text(c[0]))
+    assert "mduran" in _cell_text(puj[1])
+
+
+def test_view_org_unmapped_row_is_login_actionable():
+    hosts = [("herbert", False, "online", "", "compute", "arnau", "", False)]
+    rows = _view_org(hosts, {})
+    _cells, meta = rows[0]
+    assert meta["host"] == "herbert" and meta["action"] == "machine"
+    assert meta.get("consumer") is False  # u (set login) applies
+
+
 if __name__ == "__main__":
     import inspect
 

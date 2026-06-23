@@ -32,6 +32,8 @@ tuimux detach               # detach this terminal; the session keeps running
 tuimux autostart on|off|status  # auto-attach EVERY new local terminal to its own session
 tuimux mouse on|off|status  # tmux mouse mode: wheel scrolls the pane, not shell history
 tuimux init <host>          # auto-tmux a remote's SSH logins
+tuimux login [host user]    # show/set the SSH username per host (--rm host to clear)
+tuimux devices              # list every device in the tailnet (the team fleet)
 tuimux doctor               # check setup
 ```
 
@@ -40,6 +42,21 @@ lists the keys). Any tmux session shows up regardless of how it was started. As
 you move the cursor, a panel under the table shows a **live preview** of the
 highlighted session's pane — a read-only glimpse of what it's doing without
 attaching; press **`v`** to hide or show it.
+
+**Shared machines & the team fleet.** By default the dashboard shows your own
+machines. Press **`o`** to toggle the **org fleet view** — every device in the
+tailnet, whoever owns it, with non-compute ones (phones, etc.) grouped as
+status-only. On a shared box where your account isn't your local `$USER` (say you
+log into `herbert` as `mduran`), press **`u`** on that row to set the SSH username
+tuimux connects as — or run `tuimux login herbert mduran`. Once mapped, a host
+always appears in your list (even if a teammate owns it) and tuimux probes it as
+your user, so you see *your* tmux sessions there. Unmapped fleet machines are
+listed but not contacted until you give them a login.
+
+Access stays **passwordless** — tuimux only stores the *username*, never a
+secret. You still need permission to log in: a Tailscale SSH ACL that lets you
+assume that remote user, or your key in that user's `~/.ssh/authorized_keys`.
+Teammates each run their own tuimux, mapping the shared box to their own account.
 
 **`tuimux autostart on`** makes every new terminal you open (any app — Ghostty,
 Terminal.app, GNOME Terminal, …) drop straight into its own fresh tmux session, so

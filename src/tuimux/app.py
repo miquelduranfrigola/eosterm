@@ -123,9 +123,12 @@ def _run(args, timeout=None):
         return subprocess.CompletedProcess(args, 124, "__TIMEOUT__\n", "")
 
 
-def fetch_hosts():
+def fetch_hosts(scope="mine"):
+    # scope "org" lists the whole tailnet fleet (every owner); "mine" is your own
+    # machines plus any host you've mapped a login for.
+    args = ["__hosts", "org"] if scope == "org" else ["__hosts"]
     res = []
-    for ln in _run(["__hosts"], timeout=HOSTS_TIMEOUT).stdout.splitlines():
+    for ln in _run(args, timeout=HOSTS_TIMEOUT).stdout.splitlines():
         parts = ln.split("\t")
         if len(parts) < 2:
             continue
@@ -134,10 +137,16 @@ def fetch_hosts():
         status = parts[2].strip() if len(parts) > 2 else "online"
         lastseen = parts[3].strip() if len(parts) > 3 else ""
         kind = parts[4].strip() if len(parts) > 4 else "compute"
-        res.append((name, is_local, status, lastseen, kind))
-    # Consumer devices (phones/tablets) don't run code — park them at the end,
-    # keeping the engine's order within each group (stable sort).
-    res.sort(key=lambda r: r[4] == "consumer")
+        owner = parts[5].strip() if len(parts) > 5 else ""
+        mapping = parts[6].strip() if len(parts) > 6 else ""
+        # probe defaults true when the engine doesn't say (older output / your own).
+        probe = parts[7].strip() != "0" if len(parts) > 7 else True
+        res.append((name, is_local, status, lastseen, kind, owner, mapping, probe))
+    # Order: your own machines first (so the fleet view still opens on you), then
+    # other owners grouped together, consumers (phones/tablets) always last. Stable
+    # sort keeps the engine's self-leads order within each group.
+    my_owner = next((r[5] for r in res if r[1]), "")
+    res.sort(key=lambda r: (r[4] == "consumer", r[5] != my_owner, r[5]))
     return res
 
 
@@ -298,7 +307,7 @@ def _reconcile_sessions(old_sessions, new_sessions):
 
 
 def _probe_or_offline(h):
-    name, _is_local, status, lastseen, _kind = h
+    name, _is_local, status, lastseen = h[0], h[1], h[2], h[3]
     if status == "offline":
         # Tailscale already reports it down — skip the SSH probe (and its timeout).
         info = {
@@ -486,6 +495,8 @@ class Tuimux(App):
         Binding("x", "close", "close"),
         Binding("t", "tmux", "tmux tree"),
         Binding("v", "preview", "preview"),
+        Binding("o", "orgview", "org fleet"),
+        Binding("u", "login", "ssh user"),
         Binding("c", "console", "tailscale"),
         Binding("r", "reload", "refresh"),
         Binding("a", "awake", "keep-awake"),
@@ -526,6 +537,9 @@ class Tuimux(App):
         # the same row on every re-render — only a real selection change re-kicks.
         self._preview_key = None
         self._preview_on = True  # v toggles the panel (and its peeking) off/on
+        # "mine" = your own machines + hosts you've mapped; "org" = whole tailnet
+        # fleet (every owner). o toggles it; session-only, not persisted.
+        self._scope = "mine"
 
     def on_key(self, event):
         # Record activity so the periodic refresh can hold off while you navigate.
@@ -664,22 +678,24 @@ class Tuimux(App):
 
     @work(exclusive=True, thread=True, group="hosts")
     def _load_hosts(self):
-        hosts = fetch_hosts()
+        hosts = fetch_hosts(self._scope)
         self.call_from_thread(self._kick, hosts)
 
     def _kick(self, hosts):
         self._hosts = hosts
         # Tell the engine which host is us, so per-host probes skip the tailscale
         # lookups self_host would otherwise run on every call.
-        for name, is_local, _status, _seen, _kind in hosts:
-            if is_local:
-                _ENV["TUIMUX_SELF_HOST"] = name
+        for h in hosts:
+            if h[1]:  # is_local
+                _ENV["TUIMUX_SELF_HOST"] = h[0]
                 break
         self._render()  # show machines right away, before any probe returns
         for h in hosts:
-            name, kind = h[0], h[4]
-            if kind == "consumer":
-                continue  # phones/tablets: show online/offline only, never SSH
+            name, kind, want_probe = h[0], h[4], h[7]
+            # Skip phones/tablets (status only) and org-view hosts we have no
+            # account on (probe flag 0): they're listed but never SSH'd.
+            if kind == "consumer" or not want_probe:
+                continue
             if name not in self._probing:
                 self._probing.add(name)
                 self._probe_one(h)
@@ -848,11 +864,29 @@ class Tuimux(App):
     #           agent) — meaning carried by colour, not weight.
     def _view(self):
         rows = []
-        for host, is_local, status, _lastseen, kind in self._hosts:
+        for h in self._hosts:
+            # Tolerate short host tuples (owner/mapping/probe are newer columns):
+            # default to no owner/mapping and "probe it", i.e. pre-fleet behavior.
+            host, is_local, status, _lastseen, kind = h[0], h[1], h[2], h[3], h[4]
+            owner = h[5] if len(h) > 5 else ""
+            mapping = h[6] if len(h) > 6 else ""
+            want_probe = h[7] if len(h) > 7 else True
             info = self._results.get(host)
-            machine = {"host": host, "session": None, "action": "machine"}
-            dead = {"host": host, "session": None, "action": "none"}
-            if kind == "consumer":
+            consumer = kind == "consumer"
+            machine = {
+                "host": host, "session": None, "action": "machine",
+                "consumer": consumer, "mapping": mapping,
+            }
+            dead = {**machine, "action": "none"}
+            # In the org fleet view, tag remote machines with their owner so you can
+            # see whose box it is. Appended to the NAME cell, dim.
+            owner_tag = (
+                (("  " + owner, "dim"),) if self._scope == "org" and owner and not is_local else ()
+            )
+            # Show the SSH user on a remote host only when it's an explicit mapping
+            # (your own machines just use $USER — no need to spell it out).
+            login_tag = ((" · " + mapping, "dim"),) if mapping and not is_local else ()
+            if consumer:
                 # phones/tablets: never SSH'd — just report online/offline.
                 if status == "offline":
                     seen = _lastseen
@@ -872,12 +906,24 @@ class Tuimux(App):
                             status=(("online", "dim"),),
                         )
                     )
+            elif not want_probe:
+                # Org-fleet view: a teammate's machine we have no account on. Listed
+                # so you can see it, but never SSH'd — press u to map a login and it
+                # becomes a real, probed host.
+                rows.append(
+                    _row(
+                        machine,
+                        name=(("○ ", "dim"), (host, "dim")) + owner_tag,
+                        status=(("no login", "dim italic"),),
+                        folder=(("press u to set a login", "dim"),),
+                    )
+                )
             elif info is None:
                 # not probed yet this session — neutral placeholder, no waiting
                 rows.append(
                     _row(
                         machine,
-                        name=(("● ", "dim"), (host, "dim")),
+                        name=(("● ", "dim"), (host, "dim")) + owner_tag,
                         status=(("checking…", "dim italic"),),
                     )
                 )
@@ -886,7 +932,7 @@ class Tuimux(App):
                 rows.append(
                     _row(
                         dead,
-                        name=(("○ ", "dim"), (host, "dim")),
+                        name=(("○ ", "dim"), (host, "dim")) + owner_tag,
                         status=(("offline", "dim italic"),),
                         state=((seen, "dim"),) if seen else (),
                     )
@@ -912,7 +958,7 @@ class Tuimux(App):
                 rows.append(
                     _row(
                         dead,
-                        name=(("◐ ", AMBER), (host, f"bold {AMBER}")),
+                        name=(("◐ ", AMBER), (host, f"bold {AMBER}")) + owner_tag,
                         status=(("busy", f"bold {AMBER}"),),
                         folder=(("high load — slow to respond", "dim"),),
                     )
@@ -923,8 +969,8 @@ class Tuimux(App):
                 rows.append(
                     _row(
                         dead,
-                        name=(("◐ ", AMBER), (host, f"bold {AMBER}")),
-                        status=(("no ssh", f"bold {AMBER}"),),
+                        name=(("◐ ", AMBER), (host, f"bold {AMBER}")) + owner_tag,
+                        status=(("no ssh", f"bold {AMBER}"),) + login_tag,
                         folder=(("tailscale up --ssh", "dim"),),
                     )
                 )
@@ -936,8 +982,8 @@ class Tuimux(App):
                 rows.append(
                     _row(
                         machine,
-                        name=(("● ", color), (host, f"bold {color}")),
-                        status=(word,),
+                        name=(("● ", color), (host, f"bold {color}")) + owner_tag,
+                        status=(word,) + login_tag,
                         state=(("☕ awake", AMBER),) if info["awake"] else (),
                     )
                 )
@@ -1148,6 +1194,31 @@ class Tuimux(App):
         m = self._cur()
         if m and m["host"]:
             self._act(["__awaketoggle", m["host"]])
+
+    def action_orgview(self):
+        # Flip between your own machines and the whole tailnet fleet, then refresh
+        # right away (bypassing the idle/REFRESH gate so the toggle feels instant).
+        self._scope = "org" if self._scope == "mine" else "mine"
+        self.notify(f"{'org fleet' if self._scope == 'org' else 'my machines'}", timeout=2)
+        self._last_refresh = 0.0
+        self._load_hosts()
+
+    def action_login(self):
+        # Set/clear the SSH username tuimux uses for the highlighted host. Works on
+        # any real machine row (the login is per host, not per session).
+        m = self._cur()
+        if not m or not m.get("host") or m.get("consumer"):
+            return
+        host = m["host"]
+        current = _run(["__loginfor", host], timeout=HOSTS_TIMEOUT).stdout.strip()
+
+        def chosen(user):
+            # Empty clears the mapping (engine falls back to $USER); reload either way.
+            self._act(["__setlogin", host, user])
+
+        self.push_screen(
+            Ask(f"SSH login for {host} (blank = default):", current), chosen
+        )
 
 
 def _disposable_tmux_session():
