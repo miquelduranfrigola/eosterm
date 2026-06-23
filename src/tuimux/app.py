@@ -505,7 +505,7 @@ class Tuimux(App):
         self.sub_title = os.environ.get("TERM_PROGRAM", "terminal").lower()
         self._load_subtitle()  # fill in the login name off the UI thread
         self._capture_self_window()  # learn our own window id, for "new tab" targeting
-        self._load_autostart()  # show whether `tuimux autostart` is on, in the border
+        self._load_status_note()  # show autostart + mouse state in the panel border
         # On Linux X11, jumping to an already-open tab and the OPEN IN column
         # need wmctrl or xdotool — without them the dashboard can't see local
         # tabs at all, so every "open" silently spawns a fresh surface. Surface
@@ -560,17 +560,21 @@ class Tuimux(App):
         )
 
     @work(thread=True)
-    def _load_autostart(self):
-        state = _run(["__autostart"], timeout=HOSTS_TIMEOUT).stdout.strip()
-        self.call_from_thread(self._set_autostart, state)
+    def _load_status_note(self):
+        auto = _run(["__autostart"], timeout=HOSTS_TIMEOUT).stdout.strip()
+        mouse = _run(["__mouse"], timeout=HOSTS_TIMEOUT).stdout.strip()
+        self.call_from_thread(self._set_status_note, auto, mouse)
 
-    def _set_autostart(self, state):
-        # Note in the panel's bottom border whether new terminals auto-attach.
+    def _set_status_note(self, auto, mouse):
+        # Note in the panel's bottom border whether new terminals auto-attach and
+        # whether tmux mouse mode (wheel scrolls the pane) is on.
         try:
             wrap = self.query_one("#table-wrap")
         except Exception:
             return
-        wrap.border_subtitle = "autostart: on" if state == "on" else "autostart: off"
+        wrap.border_subtitle = (
+            f"autostart: {auto or 'off'}  ·  mouse scroll: {mouse or 'off'}"
+        )
 
     @work(thread=True)
     def _capture_self_window(self):
@@ -1072,7 +1076,9 @@ def run():
     Falls back to a plain message if the handoff can't be performed."""
     if os.environ.get("TMUX"):
         sess = _disposable_tmux_session()
-        cleanup = f"tmux kill-session -t {shlex.quote(sess)} 2>/dev/null; " if sess else ""
+        cleanup = (
+            f"tmux kill-session -t {shlex.quote(sess)} 2>/dev/null; " if sess else ""
+        )
         relaunch = f"{cleanup}TUIMUX_NO_AUTOTMUX=1 exec {shlex.quote(tuimux_bin())}"
         try:
             ok = (

@@ -12,6 +12,8 @@
 #                             the background; the terminal drops back to a shell
 #   tuimux autostart on|off   Auto-attach EVERY new local terminal to its own tmux
 #                  |status     session (edits your shell rc); status shows the state
+#   tuimux mouse on|off       Toggle tmux mouse mode — wheel scrolls the pane, not
+#                  |status     shell history (persists in ~/.tmux.conf)
 #   tuimux init <host>        Make a remote auto-tmux on SSH login (opt-in, asks first)
 #   tuimux doctor             Check local deps + per-host reachability and remote tmux
 #   tuimux -h|--help          This help
@@ -71,7 +73,7 @@ SSH_OPTS=(-o ConnectTimeout="$TUIMUX_SSH_TIMEOUT" -o BatchMode=yes -o StrictHost
 err()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
 note() { printf '\033[2m%s\033[0m\n'  "$*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
-usage() { sed -n '3,23p' "$ENGINE_FILE" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,25p' "$ENGINE_FILE" | sed 's/^# \{0,1\}//'; }
 
 # Which terminal we're running inside, normalized to a spawn driver:
 #   ghostty   → drive Ghostty (AppleScript keybind + keystroke)
@@ -988,7 +990,7 @@ if [ -z "\$TMUX" ] && [ -z "\$SSH_CONNECTION" ] && [ -z "\$TUIMUX_NO_AUTOTMUX" ]
       command rm -f "\$HOME/.cache/tuimux/skip-autostart"   # this tab was opened by tuimux
     else
       _tx_name="\$('$self' __autoname 2>/dev/null || command tuimux __autoname 2>/dev/null)"
-      tmux set -g set-titles on; tmux set -g set-titles-string '#S · #W'; tmux set -g mouse on
+      tmux set -g set-titles on; tmux set -g set-titles-string '#S · #W'
       # An explicit if, NOT a ":+" alternate-value expansion: zsh doesn't word-split
       # that, so tmux would get one "-s name" token → a " name" with a leading space.
       if [ -n "\$_tx_name" ]; then tmux new-session -s "\$_tx_name" 2>/dev/null || tmux new-session
@@ -1055,6 +1057,57 @@ autostart() {
   esac
 }
 
+# ----- mouse (tmux mouse mode: wheel scrolls the pane, not shell history) -----
+# tmux's config; TUIMUX_TMUX_CONF overrides it (tests). It's read when a tmux
+# SERVER starts, so we also apply the change live to any running server.
+tmux_conf() { printf '%s' "${TUIMUX_TMUX_CONF:-$HOME/.tmux.conf}"; }
+
+mouse_snippet() {
+cat <<'SNIP'
+# >>> tuimux mouse >>>
+set -g mouse on
+# <<< tuimux mouse <<<
+SNIP
+}
+
+# Machine-readable mouse state for the dashboard: prints "on" or "off".
+mouse_state() {
+  _block_present "$(tmux_conf)" '# >>> tuimux mouse >>>' && echo on || echo off
+}
+
+# `tuimux mouse on|off|status` — persist the setting in ~/.tmux.conf (so new tmux
+# servers pick it up) AND apply it to any running server now (so it takes effect
+# without restarting tmux). on: wheel scrolls the pane; off: back to the default.
+mouse() {
+  local action="${1:-status}" conf; conf="$(tmux_conf)"
+  case "$action" in
+    on)
+      if _block_present "$conf" '# >>> tuimux mouse >>>'; then
+        note "mouse already on ($conf) — nothing to do."
+      else
+        _block_append "$conf" mouse_snippet || { err "failed to write $conf"; exit 1; }
+        note "mouse ON ($conf) — the wheel now scrolls the pane (hold Option to select text)."
+      fi
+      tmux set -g mouse on 2>/dev/null   # apply to the running server immediately
+      ;;
+    off)
+      if _block_present "$conf" '# >>> tuimux mouse >>>'; then
+        _block_remove "$conf" '# >>> tuimux mouse >>>' '# <<< tuimux mouse <<<' \
+          || { err "failed to update $conf"; exit 1; }
+        note "mouse OFF ($conf)."
+      else
+        note "mouse already off — nothing to do."
+      fi
+      tmux set -g mouse off 2>/dev/null
+      ;;
+    status)
+      _block_present "$conf" '# >>> tuimux mouse >>>' \
+        && note "mouse: on ($conf)" || note "mouse: off ($conf)"
+      ;;
+    *) err "usage: tuimux mouse on|off|status"; exit 1 ;;
+  esac
+}
+
 # ----- doctor ----------------------------------------------------------------
 doctor() {
   printf 'tuimux doctor\n==============\n'
@@ -1113,6 +1166,7 @@ case "${1:-}" in
   attach        ) shift; attach_here "${1:-}" ;;
   detach        ) detach_here ;;
   autostart     ) shift; autostart "${1:-}" ;;
+  mouse         ) shift; mouse "${1:-status}" ;;
   init          ) shift; init_host "${1:-}" ;;
   doctor        ) doctor ;;
   # ----- backend called by the Textual UI -----
@@ -1130,6 +1184,7 @@ case "${1:-}" in
   __selfwin     ) self_winid ;;
   __autoname    ) docker_name ;;
   __autostart   ) autostart_state ;;
+  __mouse       ) mouse_state ;;
   __console     ) open_console ;;
   __awaketoggle ) shift; toggle_awake "${1:-}" >/dev/null 2>&1 ;;
   -h|--help|"" ) usage ;;

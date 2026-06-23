@@ -30,6 +30,7 @@ tuimux                      # the dashboard — all you normally need
 tuimux attach [name]        # put this terminal into a tmux session (attach or create)
 tuimux detach               # detach this terminal; the session keeps running
 tuimux autostart on|off|status  # auto-attach EVERY new local terminal to its own session
+tuimux mouse on|off|status  # tmux mouse mode: wheel scrolls the pane, not shell history
 tuimux init <host>          # auto-tmux a remote's SSH logins
 tuimux doctor               # check setup
 ```
@@ -43,11 +44,12 @@ it persists and appears in the dashboard without running `attach` by hand. It ad
 small guarded block to your shell rc (`~/.zshrc` etc.); `off` removes it, `status`
 shows the state. Skip it for one shell with `TUIMUX_NO_AUTOTMUX=1 <command>`.
 
-Every session tuimux drives gets `mouse on` set, so the trackpad scrolls tmux's
-scrollback and selects text as usual — otherwise being wrapped in tmux hides the
-terminal's own scrollback and scrolling appears to do nothing. To select/copy with
-the terminal's *native* selection instead (bypassing tmux), hold **Shift** while
-dragging (Ghostty, iTerm2, GNOME Terminal; **Option** on Apple Terminal).
+**`tuimux mouse on`** turns on tmux mouse mode so the trackpad/wheel scrolls the
+pane's scrollback instead of being sent to the shell as history. It persists the
+setting in `~/.tmux.conf` *and* applies it to the running tmux server, so it takes
+effect immediately; `off` reverts it, `status` shows the state. With it on, to
+select/copy using the terminal's *native* selection, hold **Shift** while dragging
+(Ghostty, iTerm2, GNOME Terminal; **Option** on Apple Terminal).
 
 The dashboard itself must run **outside** tmux. You don't have to think about it:
 type **`tuimux`** from anywhere — if you happen to be inside a tmux session (e.g.

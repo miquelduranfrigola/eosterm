@@ -128,8 +128,6 @@ def test_autostart_on_off_status_and_idempotency():
         assert "on" in _autostart("status", rc)
         body = open(rc).read()
         assert "# >>> tuimux autostart >>>" in body and "export FOO=1" in body
-        # autostart-wrapped terminals enable mouse mode so tmux scrollback scrolls
-        assert "set -g mouse on" in body
 
         _autostart("on", rc)  # idempotent — exactly one block
         assert open(rc).read().count("# >>> tuimux autostart >>>") == 1
@@ -139,6 +137,59 @@ def test_autostart_on_off_status_and_idempotency():
         assert "tuimux autostart" not in after  # block removed
         assert "export FOO=1" in after and "alias x=y" in after  # rest untouched
         assert "off" in _autostart("status", rc)
+
+
+# ---- CLI: mouse (tmux mouse-mode toggle) ------------------------------------
+def _mouse(action, conf, tmpdir):
+    # TMUX_TMPDIR points tmux at an empty socket dir, so the command's live
+    # `tmux set -g mouse …` finds no server and can't touch a real one.
+    r = subprocess.run(
+        ["bash", app.ENGINE, "mouse", action],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TUIMUX_TMUX_CONF": conf, "TMUX_TMPDIR": tmpdir},
+    )
+    return r.stdout + r.stderr
+
+
+def test_mouse_on_off_status_and_idempotency():
+    with tempfile.TemporaryDirectory() as d:
+        conf = os.path.join(d, "tmux.conf")
+        with open(conf, "w") as f:
+            f.write("set -g status on\n")  # pre-existing config to preserve
+
+        assert "off" in _mouse("status", conf, d)
+        _mouse("on", conf, d)
+        body = open(conf).read()
+        assert "# >>> tuimux mouse >>>" in body and "set -g mouse on" in body
+        assert "set -g status on" in body  # original config untouched
+        assert "on" in _mouse("status", conf, d)
+
+        _mouse("on", conf, d)  # idempotent — one block
+        assert open(conf).read().count("# >>> tuimux mouse >>>") == 1
+
+        _mouse("off", conf, d)
+        after = open(conf).read()
+        assert "tuimux mouse" not in after  # block removed
+        assert "set -g status on" in after  # rest preserved
+        assert "off" in _mouse("status", conf, d)
+
+
+def test_mouse_state_command_reports_on_off():
+    with tempfile.TemporaryDirectory() as d:
+        conf = os.path.join(d, "tmux.conf")
+
+        def state():
+            return subprocess.run(
+                ["bash", app.ENGINE, "__mouse"],
+                capture_output=True,
+                text=True,
+                env={**os.environ, "TUIMUX_TMUX_CONF": conf, "TMUX_TMPDIR": d},
+            ).stdout.strip()
+
+        assert state() == "off"
+        _mouse("on", conf, d)
+        assert state() == "on"
 
 
 def test_autostart_bash_links_login_profile():
@@ -742,7 +793,10 @@ def _detach_cmd(calls):
 
 def test_run_inside_tmux_detaches_and_relaunches_same_window():
     # 2-window session → NOT disposable → detach only, never killed
-    with _patched_run(returncode=0, tmux="/tmp/tmux-501/default,9,0") as (calls, launched):
+    with _patched_run(returncode=0, tmux="/tmp/tmux-501/default,9,0") as (
+        calls,
+        launched,
+    ):
         app.run()
     # never starts the dashboard in this (inside-tmux) process …
     assert launched == []
@@ -756,9 +810,10 @@ def test_run_inside_tmux_detaches_and_relaunches_same_window():
 
 def test_run_inside_tmux_kills_disposable_session():
     # 1 window / 1 pane / 1 client → a throwaway autostart shell → cleaned up
-    with _patched_run(
-        returncode=0, tmux="x", session_info="happy-curie\t1\t1\t1"
-    ) as (calls, launched):
+    with _patched_run(returncode=0, tmux="x", session_info="happy-curie\t1\t1\t1") as (
+        calls,
+        launched,
+    ):
         app.run()
     assert launched == []
     handoff = _detach_cmd(calls)[3]
