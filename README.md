@@ -51,6 +51,10 @@ effect immediately; `off` reverts it, `status` shows the state. With it on, to
 select/copy using the terminal's *native* selection, hold **Shift** while dragging
 (Ghostty, iTerm2, GNOME Terminal; **Option** on Apple Terminal).
 
+**On the first run, both `autostart` and `mouse` are enabled for you** (a one-time
+setup — it never repeats, so turning either `off` later sticks). The dashboard's
+bottom border shows the current state: `autostart: …  ·  mouse scroll: …`.
+
 The dashboard itself must run **outside** tmux. You don't have to think about it:
 type **`tuimux`** from anywhere — if you happen to be inside a tmux session (e.g.
 because autostart put you there), it detaches that client and relaunches the

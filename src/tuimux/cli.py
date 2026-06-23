@@ -2,12 +2,27 @@
 
 import os
 import shutil
+import subprocess
 import sys
 from importlib.resources import files
 
 
 def engine_path() -> str:
     return str(files("tuimux").joinpath("engine.sh"))
+
+
+def _maybe_first_run() -> None:
+    """On the very first run, let the engine enable the default features
+    (autostart + mouse scroll). A marker file makes it a one-time thing; we check
+    it here (cheap) so we only spawn the engine on that first invocation."""
+    state = os.path.expanduser(os.environ.get("TUIMUX_STATE_DIR") or "~/.config/tuimux")
+    if os.path.exists(os.path.join(state, "initialized")):
+        return
+    try:
+        env = {**os.environ, "TUIMUX_BIN": tuimux_bin()}
+        subprocess.run(["bash", engine_path(), "__firstrun"], env=env, timeout=30)
+    except Exception:
+        pass  # never let setup hiccups block launching
 
 
 def tuimux_bin() -> str:
@@ -34,6 +49,7 @@ def tuimux_bin() -> str:
 
 def main() -> None:
     args = sys.argv[1:]
+    _maybe_first_run()  # enable autostart + mouse scroll on the very first run
     if not args:
         from .app import run
 

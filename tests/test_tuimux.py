@@ -192,6 +192,47 @@ def test_mouse_state_command_reports_on_off():
         assert state() == "on"
 
 
+# ---- first run: enable autostart + mouse by default, once -------------------
+def test_first_run_enables_defaults_once_then_respects_off():
+    with tempfile.TemporaryDirectory() as d:
+        state = os.path.join(d, "state")
+        rc = os.path.join(d, "zshrc")
+        conf = os.path.join(d, "tmux.conf")
+        env = {
+            **os.environ,
+            "HOME": d,
+            "TUIMUX_STATE_DIR": state,
+            "TUIMUX_RC": rc,
+            "TUIMUX_TMUX_CONF": conf,
+            "TMUX_TMPDIR": d,  # isolate the live `tmux set` from any real server
+            "TUIMUX_BIN": "/x/tuimux",
+            "SHELL": "/bin/zsh",
+        }
+
+        def firstrun():
+            subprocess.run(
+                ["bash", app.ENGINE, "__firstrun"],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+
+        firstrun()  # first run → both defaults on, marker written
+        assert os.path.exists(os.path.join(state, "initialized"))
+        assert "# >>> tuimux autostart >>>" in open(rc).read()
+        assert "# >>> tuimux mouse >>>" in open(conf).read()
+
+        # user turns autostart off; a later run must NOT re-enable it (marker guards)
+        subprocess.run(
+            ["bash", app.ENGINE, "autostart", "off"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        firstrun()
+        assert "tuimux autostart" not in open(rc).read()
+
+
 def test_autostart_bash_links_login_profile():
     # bash login shells (macOS) read .bash_profile/.profile, not .bashrc — so
     # `autostart on` must also make the login profile source .bashrc, and `off`

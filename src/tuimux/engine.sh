@@ -1108,6 +1108,24 @@ mouse() {
   esac
 }
 
+# ----- first run -------------------------------------------------------------
+# On the very first run (pip can't reliably run post-install hooks, so we do it
+# here), turn on the sensible defaults: autostart + mouse scroll. A one-time
+# marker means it never repeats — so it won't fight a later `… off`, and upgrades
+# don't re-enable. TUIMUX_STATE_DIR overrides the marker location (tests).
+first_run_setup() {
+  local state marker
+  state="${TUIMUX_STATE_DIR:-$HOME/.config/tuimux}"
+  marker="$state/initialized"
+  [ -e "$marker" ] && return 0
+  mkdir -p "$state" 2>/dev/null
+  : > "$marker"   # mark first, so a hiccup can't make this loop on every launch
+  note "tuimux first run — enabling autostart + mouse scroll by default"
+  note "(turn either off any time:  tuimux autostart off  /  tuimux mouse off)"
+  autostart on >/dev/null 2>&1
+  mouse on >/dev/null 2>&1
+}
+
 # ----- doctor ----------------------------------------------------------------
 doctor() {
   printf 'tuimux doctor\n==============\n'
@@ -1185,6 +1203,7 @@ case "${1:-}" in
   __autoname    ) docker_name ;;
   __autostart   ) autostart_state ;;
   __mouse       ) mouse_state ;;
+  __firstrun    ) first_run_setup ;;
   __console     ) open_console ;;
   __awaketoggle ) shift; toggle_awake "${1:-}" >/dev/null 2>&1 ;;
   -h|--help|"" ) usage ;;
