@@ -349,6 +349,15 @@ probe_host() {
   if out="$(rssh "$1" "$REMOTE_PROBE" 2>/dev/null)"; then printf 'OK\n%s\n' "$out"; else echo UNREACHABLE; fi
 }
 
+# Read-only snapshot of a session's active pane, for the dashboard's live preview.
+# `-p` → stdout, `-e` → keep colour escapes (the UI renders them). Non-intrusive;
+# empty output if the session/host is gone. Local via sh, remote via Tailscale SSH.
+peek_pane() {
+  local host="$1" session="$2"
+  [ -n "$host" ] && [ -n "$session" ] || return 0
+  rssh "$host" "tmux capture-pane -p -e -t '$session' 2>/dev/null"
+}
+
 # ----- attach / new ----------------------------------------------------------
 # Run an action; when $4 = exec, replace the process (CLI). Otherwise return
 # control to the caller after the SSH session ends (TUI home loop).
@@ -1190,6 +1199,7 @@ case "${1:-}" in
   # ----- backend called by the Textual UI -----
   __hosts       ) hosts_data ;;
   __probe       ) shift; probe_host "${1:-}" ;;
+  __peek        ) shift; peek_pane "${1:-}" "${2:-}" ;;
   __login       ) printf '%s\n' "$TUIMUX_LOGIN" ;;
   __attach      ) shift; do_attach "${1:-}" "${2:-}" "${3:-}" exec ;;
   __open        ) shift; open_surface "${1:-}" "${2:-}" "${3:-}" "${4:-}" ;;

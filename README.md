@@ -36,7 +36,10 @@ tuimux doctor               # check setup
 ```
 
 Open / rename / detach / close / keep-awake all happen in the dashboard (footer
-lists the keys). Any tmux session shows up regardless of how it was started.
+lists the keys). Any tmux session shows up regardless of how it was started. As
+you move the cursor, a panel under the table shows a **live preview** of the
+highlighted session's pane — a read-only glimpse of what it's doing without
+attaching; press **`v`** to hide or show it.
 
 **`tuimux autostart on`** makes every new terminal you open (any app — Ghostty,
 Terminal.app, GNOME Terminal, …) drop straight into its own fresh tmux session, so

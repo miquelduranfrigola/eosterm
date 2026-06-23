@@ -1034,6 +1034,32 @@ def test_linux_list_windows_x11_keeps_only_terminals():
     assert out.strip().splitlines() == ["1|tuimux", "2|happy-curie · main"]
 
 
+def test_preview_tail_trims_trailing_blanks_and_keeps_newest():
+    # A tmux pane pads empty rows below the prompt; the preview drops them so the
+    # last real line lands at the bottom, and keeps only the newest `height`.
+    raw = "line1\nline2\nline3\nprompt $ \n\n\n"
+    assert app._preview_tail(raw, 10) == ["line1", "line2", "line3", "prompt $ "]
+    assert app._preview_tail(raw, 2) == ["line3", "prompt $ "]
+
+
+def test_preview_tail_empty_capture_is_empty_list():
+    assert app._preview_tail("", 12) == []
+    assert app._preview_tail("\n\n  \n", 12) == []
+
+
+def test_peek_with_missing_args_is_an_empty_noop():
+    # The engine's __peek must not error or capture anything when it has no
+    # session to point at (e.g. cursor on a machine header) — it just returns
+    # nothing, which the UI renders as an empty preview.
+    r = subprocess.run(
+        ["bash", app.ENGINE, "__peek", "somehost"],
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 0
+    assert r.stdout.strip() == ""
+
+
 if __name__ == "__main__":
     import inspect
 

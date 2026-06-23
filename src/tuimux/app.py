@@ -22,7 +22,7 @@ from textual.binding import Binding
 from textual.containers import Vertical
 from textual.coordinate import Coordinate
 from textual.screen import ModalScreen
-from textual.widgets import Header, Footer, DataTable, Label, Input, OptionList
+from textual.widgets import Header, Footer, DataTable, Label, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 from .cli import tuimux_bin
@@ -99,6 +99,13 @@ ACTION_TIMEOUT = float(os.environ.get("TUIMUX_ACTION_TIMEOUT", "15") or 15)
 HOSTS_TIMEOUT = float(os.environ.get("TUIMUX_HOSTS_TIMEOUT", "8") or 8)
 # Terminal window/tab scan (AppleScript) used to show where a session is open.
 WINDOWS_TIMEOUT = float(os.environ.get("TUIMUX_WINDOWS_TIMEOUT", "5") or 5)
+# Live-preview pane capture (tmux capture-pane, local or over SSH). Short, since
+# it's a tiny read that fires on navigation and every heartbeat.
+PEEK_TIMEOUT = float(os.environ.get("TUIMUX_PEEK_TIMEOUT", "6") or 6)
+# How many of the pane's most-recent lines the preview shows when its on-screen
+# height isn't known yet (before first layout). The tail is what matters — the
+# prompt and the latest output sit at the bottom of a tmux pane.
+PREVIEW_LINES = 12
 
 
 def _run(args, timeout=None):
@@ -171,6 +178,19 @@ def _auto_name(name, dird, is_agent, cmd):
     if cmd and cmd not in SHELLS:
         return cmd
     return name
+
+
+def _preview_tail(raw, height):
+    """The lines a pane capture should show, newest at the bottom.
+
+    Trims trailing blank lines (a tmux pane is usually padded with empties below
+    the prompt) so the latest output sits on the panel's last row, then keeps the
+    final `height` lines — the tail is what tells you what the session is doing.
+    Returns [] for an all-blank/empty capture."""
+    lines = raw.split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return lines[-height:] if height > 0 else lines
 
 
 def probe(host):
@@ -426,6 +446,18 @@ class Tuimux(App):
         height: 1fr;
     }
     DataTable { height: 1fr; background: $surface; }
+    #preview {
+        height: 1fr;
+        margin: 0 2 1 2;
+        padding: 0 1;
+        border: round $primary 40%;
+        border-title-color: $primary;
+        border-title-style: bold;
+        border-title-align: left;
+        background: $surface;
+        color: $text;
+        overflow: hidden;
+    }
     DataTable > .datatable--cursor { background: $primary 20%; color: $text; }
     DataTable > .datatable--header {
         color: $text-muted; text-style: bold; background: $surface;
@@ -453,6 +485,7 @@ class Tuimux(App):
         Binding("d", "detach", "detach"),
         Binding("x", "close", "close"),
         Binding("t", "tmux", "tmux tree"),
+        Binding("v", "preview", "preview"),
         Binding("c", "console", "tailscale"),
         Binding("r", "reload", "refresh"),
         Binding("a", "awake", "keep-awake"),
@@ -487,6 +520,12 @@ class Tuimux(App):
         self._self_win = None
         self._last_input = 0.0  # monotonic time of the last keypress (idle debounce)
         self._last_refresh = 0.0  # monotonic time of the last actual refresh
+        self._preview = None  # cached Static handle for the live-preview panel
+        # (host, session) currently mirrored in the preview, or None when the
+        # cursor isn't on a live session. Guards stale peeks and avoids re-peeking
+        # the same row on every re-render — only a real selection change re-kicks.
+        self._preview_key = None
+        self._preview_on = True  # v toggles the panel (and its peeking) off/on
 
     def on_key(self, event):
         # Record activity so the periodic refresh can hold off while you navigate.
@@ -498,6 +537,7 @@ class Tuimux(App):
         with Vertical(id="table-wrap") as w:
             w.border_title = "tuimux by Ersilia"
             yield SessionTable(cursor_type="row", zebra_stripes=False)
+        yield Static(id="preview")
         yield Footer()
 
     def on_mount(self):
@@ -545,6 +585,8 @@ class Tuimux(App):
         ):
             t.add_column(col, key=key, width=w)
         t.focus()
+        self._preview = self.query_one("#preview", Static)
+        self._set_preview_idle()
         self.reload()
         # Heartbeat faster than REFRESH so we notice you've gone quiet promptly;
         # reload() itself enforces the REFRESH cadence and the idle debounce.
@@ -615,6 +657,10 @@ class Tuimux(App):
             return
         self._last_refresh = now
         self._load_hosts()
+        # Keep the preview live: re-capture the selected session each refresh so
+        # its panel tracks the real pane, not just a snapshot from when you landed.
+        if self._preview_on and self._preview_key is not None:
+            self._peek_one(self._preview_key)
 
     @work(exclusive=True, thread=True, group="hosts")
     def _load_hosts(self):
@@ -683,6 +729,66 @@ class Tuimux(App):
         self._windows = wins
         self._self_win = self_win
         self._render()
+
+    # ---- live preview ----
+    # A panel under the table mirrors the highlighted session's pane — a glimpse
+    # of what it's actually doing without attaching. It updates as you move the
+    # cursor (only on a real selection change) and on every heartbeat, so the
+    # selected session stays live. Capture is read-only (tmux capture-pane), so
+    # it never steals focus or disturbs the session.
+    def on_data_table_row_highlighted(self, _event):
+        self._sync_preview_target()
+
+    def _sync_preview_target(self):
+        # Point the preview at the current row, if it's a live session. Re-kick a
+        # capture only when the target actually changes — re-renders that keep the
+        # cursor on the same session shouldn't spawn a peek every time.
+        m = self._cur()
+        key = (m["host"], m["session"]) if m and m.get("action") == "attach" else None
+        if key == self._preview_key:
+            return
+        self._preview_key = key
+        if not self._preview_on:
+            return
+        if key is None:
+            self._set_preview_idle()
+        else:
+            # Title updates immediately; the body fills in when the capture lands.
+            self._preview.border_title = f" {key[1]} · {key[0]} "
+            self._peek_one(key)
+
+    @work(thread=True, exclusive=True, group="peek")
+    def _peek_one(self, key):
+        host, session = key
+        raw = _run(["__peek", host, session], timeout=PEEK_TIMEOUT).stdout
+        self.call_from_thread(self._show_preview, key, raw)
+
+    def _show_preview(self, key, raw):
+        # Ignore a capture that finished after the cursor moved on (exclusive
+        # workers cancel queued peeks, but one already mid-SSH still returns).
+        if not self._preview_on or key != self._preview_key:
+            return
+        # Show the most-recent lines that fit; size.height is 0 until first layout.
+        height = self._preview.size.height or PREVIEW_LINES
+        lines = _preview_tail(raw, height)
+        if not lines:
+            self._preview.update(Text("  (pane is empty)", style="dim italic"))
+            return
+        self._preview.update(Text.from_ansi("\n".join(lines)))
+
+    def _set_preview_idle(self):
+        self._preview.border_title = " preview "
+        self._preview.update(
+            Text("  Move to a session to preview its output.", style="dim italic")
+        )
+
+    def action_preview(self):
+        self._preview_on = not self._preview_on
+        self._preview.display = self._preview_on
+        if self._preview_on:
+            # Force a re-target: the key may be stale from while it was hidden.
+            self._preview_key = None
+            self._sync_preview_target()
 
     def _window_locs(self, session_name):
         """Labels for every terminal window *on this Mac* showing this session.
