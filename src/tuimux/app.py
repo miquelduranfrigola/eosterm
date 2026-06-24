@@ -866,8 +866,8 @@ class Tuimux(App):
     #   accent → the device's own colour, used as the identity thread: its machine
     #            NAME/STATUS *and* its session NAMEs. Within a device block this is
     #            the only hue — so each device reads as one calm colour family.
-    #   bold   → identifiers: an online machine's NAME + STATUS word, and an
-    #            attached session's NAME (bold accent). Nothing else is bold.
+    #   bold   → the machine (device) NAME only. Nothing else is bold — not the
+    #            STATUS word, not session names.
     #   amber  → the one thing that wants you: an agent STATE of "waiting" (plus
     #            keep-awake / no-ssh markers). Kept rare so it actually pops.
     #   violet → the "claude" agent tag — a single, global "this is an AI agent".
@@ -971,7 +971,7 @@ class Tuimux(App):
                     _row(
                         dead,
                         name=(("◐ ", AMBER), (host, f"bold {AMBER}")) + owner_tag,
-                        status=(("busy", f"bold {AMBER}"),),
+                        status=(("busy", AMBER),),
                         folder=(("high load — slow to respond", "dim"),),
                     )
                 )
@@ -982,7 +982,7 @@ class Tuimux(App):
                     _row(
                         dead,
                         name=(("◐ ", AMBER), (host, f"bold {AMBER}")) + owner_tag,
-                        status=(("no ssh", f"bold {AMBER}"),) + login_tag,
+                        status=(("no ssh", AMBER),) + login_tag,
                         folder=(("tailscale up --ssh", "dim"),),
                     )
                 )
@@ -992,7 +992,7 @@ class Tuimux(App):
                 # Use the engine's colour (so the tmux bar matches); fall back to
                 # the local hash only if it's somehow absent (older engine output).
                 color = accent or _host_color(host, is_local)
-                word = ("local" if is_local else "ssh", f"bold {color}")
+                word = ("local" if is_local else "ssh", color)
                 rows.append(
                     _row(
                         machine,
@@ -1013,11 +1013,9 @@ class Tuimux(App):
                     # pin down the tab, the menu honestly offers a new tab
                     # instead of promising focus the engine can't deliver.
                     locs = self._window_locs(s["name"])
-                    # Session name carries the device accent: bold when attached,
-                    # dim when it's just an idle shell, plain-accent otherwise.
-                    if s["attached"]:
-                        nm_style = f"bold {color}"
-                    elif s["state"] == "idle":
+                    # Session name carries the device accent (never bold — only the
+                    # machine name is). Dim when it's just an idle, unattached shell.
+                    if s["state"] == "idle" and not s["attached"]:
                         nm_style = "dim"
                     else:
                         nm_style = color

@@ -569,16 +569,17 @@ def test_view_bold_only_on_identifiers():
         },
     }
     rows = _view_for(hosts, results)
-    bolded = {
-        _cell_text(cells[0]).strip(): True
-        for cells, _ in rows
-        if any("bold" in _cell_styles(cell) for cell in cells)
-    }
-    # online machine name and the attached session are bold; nothing else
-    assert "● me" in bolded
-    assert any(name.endswith("att") for name in bolded)  # attached session
-    assert not any("det" in name for name in bolded)  # detached session not bold
-    assert not any("off" in name for name in bolded)  # offline machine not bold
+
+    def find(label):
+        return next(c for c, _ in rows if label in _cell_text(c[0]))
+
+    me = find("● me")
+    # Only the online machine NAME is bold — not its STATUS word, not sessions.
+    assert "bold" in _cell_styles(me[0])
+    assert "bold" not in _cell_styles(me[1])  # STATUS word not bold
+    assert "bold" not in _cell_styles(find("att")[0])  # attached session not bold
+    assert "bold" not in _cell_styles(find("det")[0])  # detached session not bold
+    assert "bold" not in _cell_styles(find("○ off")[0])  # offline machine not bold
 
 
 def test_view_row_meta_actions():
@@ -780,8 +781,9 @@ def test_session_rows_use_device_accent_and_dim_metadata():
     def cells_for(n):
         return next(c for c, _ in rows if n in _cell_text(c[0]))
 
-    # attached → bold accent; idle+unattached → dim; otherwise plain accent
-    assert "bold #abcdef" in _cell_styles(cells_for("att")[0])
+    # accent (never bold); idle+unattached → dim; attached/running → plain accent
+    att_name = _cell_styles(cells_for("att")[0])
+    assert "#abcdef" in att_name and "bold" not in att_name
     assert "dim" in _cell_styles(cells_for("idle1")[0])
     run_name = _cell_styles(cells_for("run1")[0])
     assert "#abcdef" in run_name and "bold" not in run_name
