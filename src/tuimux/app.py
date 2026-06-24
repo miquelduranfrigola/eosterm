@@ -508,7 +508,7 @@ class Tuimux(App):
         Binding("t", "tmux", "tmux tree"),
         Binding("v", "preview", "preview"),
         Binding("o", "orgview", "org fleet"),
-        Binding("u", "login", "ssh user"),
+        Binding("u", "login", "set login"),
         Binding("c", "console", "tailscale"),
         Binding("r", "reload", "refresh"),
         Binding("a", "awake", "keep-awake"),
@@ -641,8 +641,11 @@ class Tuimux(App):
             wrap = self.query_one("#table-wrap")
         except Exception:
             return
+        # Keep the "press u" hint last: the subtitle is right-aligned, so on a
+        # narrow terminal the settings get clipped first and the hint stays visible.
         wrap.border_subtitle = (
             f"autostart: {auto or 'off'}  ·  mouse scroll: {mouse or 'off'}"
+            "  ·  press u to set the SSH login"
         )
 
     @work(thread=True)
