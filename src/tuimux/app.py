@@ -62,12 +62,17 @@ VIOLET = "#b08cff"  # agent
 AMBER = "#e0af68"  # awake / waiting / no-ssh
 GREEN = "#9ece6a"  # active session / running / working
 
-# Per-session STATE word → colour (weight stays plain; colour carries meaning).
-_STATE_STYLE = {"waiting": AMBER, "working": GREEN, "running": GREEN, "idle": "dim"}
+# Per-session STATE word → colour. Only the one state that *wants you* (a waiting
+# agent) gets a colour — amber. Everything else is plain or dim, so the device's
+# own accent stays the dominant colour in its block and amber actually stands out.
+# (No green here: it would collide with the green-ish device accents.)
+_STATE_STYLE = {"waiting": AMBER, "working": "", "running": "", "idle": "dim"}
 
-# Stable per-machine accent: this machine is always teal; each remote hashes its
-# name into this palette. engine.sh `host_color` mirrors this exactly (same
-# palette + hash) so a session's tmux status bar matches its colour here.
+# Per-machine accent. The engine (host_color) is the source of truth — it derives
+# a distinct colour per host from the canonical fleet ordering and hands it to the
+# dashboard via the hosts_data `color` column, so the tmux status bar always
+# matches. This local hash is only a fallback for older engine output that doesn't
+# emit the column (and to keep the older view-model tests working).
 HOST_PALETTE = (
     "#7aa2f7",
     "#b08cff",
@@ -123,9 +128,12 @@ def _run(args, timeout=None):
         return subprocess.CompletedProcess(args, 124, "__TIMEOUT__\n", "")
 
 
-def fetch_hosts():
+def fetch_hosts(scope="mine"):
+    # scope "org" lists the whole tailnet fleet (every owner); "mine" is your own
+    # machines plus any host you've mapped a login for.
+    args = ["__hosts", "org"] if scope == "org" else ["__hosts"]
     res = []
-    for ln in _run(["__hosts"], timeout=HOSTS_TIMEOUT).stdout.splitlines():
+    for ln in _run(args, timeout=HOSTS_TIMEOUT).stdout.splitlines():
         parts = ln.split("\t")
         if len(parts) < 2:
             continue
@@ -134,10 +142,23 @@ def fetch_hosts():
         status = parts[2].strip() if len(parts) > 2 else "online"
         lastseen = parts[3].strip() if len(parts) > 3 else ""
         kind = parts[4].strip() if len(parts) > 4 else "compute"
-        res.append((name, is_local, status, lastseen, kind))
-    # Consumer devices (phones/tablets) don't run code — park them at the end,
-    # keeping the engine's order within each group (stable sort).
-    res.sort(key=lambda r: r[4] == "consumer")
+        owner = parts[5].strip() if len(parts) > 5 else ""
+        mapping = parts[6].strip() if len(parts) > 6 else ""
+        # probe defaults true when the engine doesn't say (older output / your own).
+        probe = parts[7].strip() != "0" if len(parts) > 7 else True
+        # accent colour computed by the engine (host_color) — kept there as the
+        # single source of truth so the tmux status bar matches this row exactly.
+        color = parts[8].strip() if len(parts) > 8 else ""
+        # resolved SSH username (login_for) — who we connect as on this host.
+        login = parts[9].strip() if len(parts) > 9 else ""
+        res.append(
+            (name, is_local, status, lastseen, kind, owner, mapping, probe, color, login)
+        )
+    # Order: your own machines first (so the fleet view still opens on you), then
+    # other owners grouped together, consumers (phones/tablets) always last. Stable
+    # sort keeps the engine's self-leads order within each group.
+    my_owner = next((r[5] for r in res if r[1]), "")
+    res.sort(key=lambda r: (r[4] == "consumer", r[5] != my_owner, r[5]))
     return res
 
 
@@ -298,7 +319,7 @@ def _reconcile_sessions(old_sessions, new_sessions):
 
 
 def _probe_or_offline(h):
-    name, _is_local, status, lastseen, _kind = h
+    name, _is_local, status, lastseen = h[0], h[1], h[2], h[3]
     if status == "offline":
         # Tailscale already reports it down — skip the SSH probe (and its timeout).
         info = {
@@ -317,7 +338,7 @@ def _probe_or_offline(h):
 # so one cell can mix styles (e.g. a dim marker + a bold host name); an empty
 # tuple renders blank. _row() builds a (cells, meta) pair, filling only the
 # columns you name and leaving the rest empty — keeps _view readable.
-_COLS = ("name", "status", "state", "uptime", "folder", "tabs", "open_in", "agent")
+_COLS = ("name", "status", "state", "uptime", "folder", "tabs", "open_in", "user")
 
 
 def _row(meta, **cells):
@@ -486,6 +507,8 @@ class Tuimux(App):
         Binding("x", "close", "close"),
         Binding("t", "tmux", "tmux tree"),
         Binding("v", "preview", "preview"),
+        Binding("o", "orgview", "org fleet"),
+        Binding("u", "login", "set login"),
         Binding("c", "console", "tailscale"),
         Binding("r", "reload", "refresh"),
         Binding("a", "awake", "keep-awake"),
@@ -526,6 +549,9 @@ class Tuimux(App):
         # the same row on every re-render — only a real selection change re-kicks.
         self._preview_key = None
         self._preview_on = True  # v toggles the panel (and its peeking) off/on
+        # "mine" = your own machines + hosts you've mapped; "org" = whole tailnet
+        # fleet (every owner). o toggles it; session-only, not persisted.
+        self._scope = "mine"
 
     def on_key(self, event):
         # Record activity so the periodic refresh can hold off while you navigate.
@@ -577,11 +603,12 @@ class Tuimux(App):
             ("UPTIME", "uptime", 7),
             ("FOLDER", "folder", 20),
             ("TABS", "tabs", 12),
-            # wide enough for "other window · NN clients"; the transient "resumed"
-            # marker can append a little more, but it only lands on just-reconnected
-            # sessions, which are detached (0 clients) → short, so it fits in practice.
-            ("OPEN IN", "open", 26),
-            ("AGENT", "agent", 10),
+            # one window token ("other window") or "— · NN clients"; the transient
+            # "resumed" marker can append on a just-reconnected (detached) session.
+            ("OPEN IN", "open", 18),
+            # the machine's owner and the login we connect as (gray); blank on
+            # session rows. "miquel · mduranfrigola" is the long case.
+            ("USER", "user", 22),
         ):
             t.add_column(col, key=key, width=w)
         t.focus()
@@ -614,8 +641,11 @@ class Tuimux(App):
             wrap = self.query_one("#table-wrap")
         except Exception:
             return
+        # Keep the "press u" hint last: the subtitle is right-aligned, so on a
+        # narrow terminal the settings get clipped first and the hint stays visible.
         wrap.border_subtitle = (
             f"autostart: {auto or 'off'}  ·  mouse scroll: {mouse or 'off'}"
+            "  ·  press u to set the SSH login"
         )
 
     @work(thread=True)
@@ -664,22 +694,24 @@ class Tuimux(App):
 
     @work(exclusive=True, thread=True, group="hosts")
     def _load_hosts(self):
-        hosts = fetch_hosts()
+        hosts = fetch_hosts(self._scope)
         self.call_from_thread(self._kick, hosts)
 
     def _kick(self, hosts):
         self._hosts = hosts
         # Tell the engine which host is us, so per-host probes skip the tailscale
         # lookups self_host would otherwise run on every call.
-        for name, is_local, _status, _seen, _kind in hosts:
-            if is_local:
-                _ENV["TUIMUX_SELF_HOST"] = name
+        for h in hosts:
+            if h[1]:  # is_local
+                _ENV["TUIMUX_SELF_HOST"] = h[0]
                 break
         self._render()  # show machines right away, before any probe returns
         for h in hosts:
-            name, kind = h[0], h[4]
-            if kind == "consumer":
-                continue  # phones/tablets: show online/offline only, never SSH
+            name, kind, want_probe = h[0], h[4], h[7]
+            # Skip phones/tablets (status only) and org-view hosts we have no
+            # account on (probe flag 0): they're listed but never SSH'd.
+            if kind == "consumer" or not want_probe:
+                continue
             if name not in self._probing:
                 self._probing.add(name)
                 self._probe_one(h)
@@ -811,48 +843,87 @@ class Tuimux(App):
         return locs
 
     def _open_in_cell(self, s, locs):
-        """OPEN IN as two tokens, "<local> · <host>":
+        """OPEN IN — where you can reach this session.
 
-          local — where it's open on THIS Mac: this window / other window / — (none)
-          host  — its live attachment on the host where it runs: on host (1 client) /
-                  N clients (more) / detached (none)
-
-        The two are independent: a stale local tab reads "this window · detached",
-        and a session attached only from elsewhere reads "— · on host"."""
+        If it's open as a tab on THIS Mac, say just that ("this window" /
+        "other window") and stop: you can jump to it, and the host-side attachment
+        is implied. Otherwise ("—", no local tab) report its attachment on the host
+        that runs it — "N clients" if something holds it (e.g. a teammate on a
+        shared box), else "detached". We never say "on host": for a local session
+        the host *is* this Mac, which only ever read as confusing."""
         if "this window" in locs:
-            local = ("this window", LOCAL)
-        elif locs:
-            local = ("other window", LOCAL)
-        else:
-            local = ("—", "dim")
+            return [("this window", "")]
+        if locs:
+            return [("other window", "dim")]
         n = s.get("nclients", 0)
-        # The host axis reads attachment the same way the NAME does (s["attached"]),
-        # so the two can never disagree — e.g. a client that switch-client'd away can
-        # leave session_attached set with no list-clients line; trust attached here
-        # and let nclients only split one client ("on host") from many ("N clients").
-        if s.get("attached") or n:
-            host = ("on host", REMOTE) if n <= 1 else (f"{n} clients", REMOTE)
+        # No local tab, but a client may still hold it from elsewhere. Trust
+        # attached too (a switch-client'd session can show attached with no
+        # list-clients line); n only splits one client from many.
+        if n > 1:
+            host = (f"{n} clients", "dim")
+        elif n == 1 or s.get("attached"):
+            host = ("1 client", "dim")
         else:
             host = ("detached", "dim")
-        return [local, (" · ", "dim"), host]
+        return [("—", "dim"), (" · ", "dim"), host]
+
+    @staticmethod
+    def _user_cell(owner, login, want_probe, consumer):
+        """The gray USER cell on a machine header: the owner of the box, plus the
+        login we connect as when it's a real one (our own machine or a mapped host)
+        and it differs from the owner. Never empty — "owner · login", or just one
+        name when they're the same or only one is known."""
+        parts = [owner] if owner else []
+        if want_probe and not consumer and login and login != owner:
+            parts.append(login)
+        text = " · ".join(parts) or login or "—"
+        return ((text, "dim"),)
+
+    @staticmethod
+    def _tabs_cell(tabs):
+        """TABS reads "<count>  <active-cmd>"; tint the command violet when the
+        active window is an AI agent (its command contains "claude")."""
+        head, sep, cmd = tabs.partition("  ")
+        if sep and "claude" in cmd.lower():
+            return ((head + sep, "dim"), (cmd, VIOLET))
+        return ((tabs, "dim"),)
 
     # Build the table as plain data — a list of (cells, meta) rows — so we can
     # diff cheaply and only repaint when something actually changed.
     #
-    # Emphasis convention (keep consistent when editing styles here):
-    #   bold  → identifiers only: an online machine's NAME + STATUS word, and an
-    #           attached session's NAME. Nothing else is ever bold.
-    #   dim   → inactive/transient (offline & "checking…" machines, idle
-    #           sessions), plain numeric metrics (uptime, tabs), and hints.
-    #   plain → markers, STATE values, and colour-coded fields (folder, open-in,
-    #           agent) — meaning carried by colour, not weight.
+    # Colour & emphasis convention (keep consistent when editing styles here):
+    #   accent → the device's own colour, used as the identity thread: its machine
+    #            NAME/STATUS *and* its session NAMEs. Within a device block this is
+    #            the only hue — so each device reads as one calm colour family.
+    #   bold   → the machine (device) NAME only. Nothing else is bold — not the
+    #            STATUS word, not session names.
+    #   amber  → the one thing that wants you: an agent STATE of "waiting" (plus
+    #            keep-awake / no-ssh markers). Kept rare so it actually pops.
+    #   violet → "claude" inside the TABS column (the active window is an AI agent).
+    #   dim    → everything else: metadata (folder, tabs, uptime, OPEN IN, USER),
+    #            idle/transient sessions, offline/"checking…" machines, hints.
     def _view(self):
         rows = []
-        for host, is_local, status, _lastseen, kind in self._hosts:
+        for h in self._hosts:
+            # Tolerate short host tuples (owner/mapping/probe/color/login are newer
+            # columns): default to no owner/login and "probe it" (pre-fleet behavior).
+            host, is_local, status, _lastseen, kind = h[0], h[1], h[2], h[3], h[4]
+            owner = h[5] if len(h) > 5 else ""
+            mapping = h[6] if len(h) > 6 else ""
+            want_probe = h[7] if len(h) > 7 else True
+            accent = h[8] if len(h) > 8 else ""  # engine-computed color (may be "")
+            login = h[9] if len(h) > 9 else ""  # resolved SSH user (login_for)
             info = self._results.get(host)
-            machine = {"host": host, "session": None, "action": "machine"}
-            dead = {"host": host, "session": None, "action": "none"}
-            if kind == "consumer":
+            consumer = kind == "consumer"
+            machine = {
+                "host": host, "session": None, "action": "machine",
+                "consumer": consumer, "mapping": mapping,
+            }
+            dead = {**machine, "action": "none"}
+            # The USER cell (gray) goes on every machine header: the owner, plus the
+            # login we connect as when it's a real one that adds info. Never empty.
+            user = self._user_cell(owner, login, want_probe, consumer)
+            if consumer:
                 # phones/tablets: never SSH'd — just report online/offline.
                 if status == "offline":
                     seen = _lastseen
@@ -862,6 +933,7 @@ class Tuimux(App):
                             name=(("○ ", "dim"), (host, "dim")),
                             status=(("offline", "dim italic"),),
                             state=((seen, "dim"),) if seen else (),
+                            user=user,
                         )
                     )
                 else:
@@ -870,8 +942,22 @@ class Tuimux(App):
                             dead,
                             name=(("● ", "dim"), (host, "dim")),
                             status=(("online", "dim"),),
+                            user=user,
                         )
                     )
+            elif not want_probe:
+                # Org-fleet view: a teammate's machine we have no account on. Listed
+                # so you can see it, but never SSH'd — press u to map a login and it
+                # becomes a real, probed host.
+                rows.append(
+                    _row(
+                        machine,
+                        name=(("○ ", "dim"), (host, "dim")),
+                        status=(("no login", "dim italic"),),
+                        folder=(("press u to set a login", "dim"),),
+                        user=user,
+                    )
+                )
             elif info is None:
                 # not probed yet this session — neutral placeholder, no waiting
                 rows.append(
@@ -879,6 +965,7 @@ class Tuimux(App):
                         machine,
                         name=(("● ", "dim"), (host, "dim")),
                         status=(("checking…", "dim italic"),),
+                        user=user,
                     )
                 )
             elif not info["reachable"] and status == "offline":
@@ -889,6 +976,7 @@ class Tuimux(App):
                         name=(("○ ", "dim"), (host, "dim")),
                         status=(("offline", "dim italic"),),
                         state=((seen, "dim"),) if seen else (),
+                        user=user,
                     )
                 )
                 # The host is down, but its tmux sessions almost certainly are
@@ -913,8 +1001,9 @@ class Tuimux(App):
                     _row(
                         dead,
                         name=(("◐ ", AMBER), (host, f"bold {AMBER}")),
-                        status=(("busy", f"bold {AMBER}"),),
+                        status=(("busy", AMBER),),
                         folder=(("high load — slow to respond", "dim"),),
+                        user=user,
                     )
                 )
             elif not info["reachable"]:
@@ -924,21 +1013,25 @@ class Tuimux(App):
                     _row(
                         dead,
                         name=(("◐ ", AMBER), (host, f"bold {AMBER}")),
-                        status=(("no ssh", f"bold {AMBER}"),),
+                        status=(("no ssh", AMBER),),
                         folder=(("tailscale up --ssh", "dim"),),
+                        user=user,
                     )
                 )
             else:
                 # reachable — machine header, tinted with the machine's accent
                 # (local = teal; each remote its own colour). STATUS word matches.
-                color = _host_color(host, is_local)
-                word = ("local" if is_local else "ssh", f"bold {color}")
+                # Use the engine's colour (so the tmux bar matches); fall back to
+                # the local hash only if it's somehow absent (older engine output).
+                color = accent or _host_color(host, is_local)
+                word = ("local" if is_local else "ssh", color)
                 rows.append(
                     _row(
                         machine,
                         name=(("● ", color), (host, f"bold {color}")),
                         status=(word,),
                         state=(("☕ awake", AMBER),) if info["awake"] else (),
+                        user=user,
                     )
                 )
                 # Just-reconnected? Show for RECONCILE_TTL which sessions are the
@@ -953,6 +1046,12 @@ class Tuimux(App):
                     # pin down the tab, the menu honestly offers a new tab
                     # instead of promising focus the engine can't deliver.
                     locs = self._window_locs(s["name"])
+                    # Session name carries the device accent (never bold — only the
+                    # machine name is). Dim when it's just an idle, unattached shell.
+                    if s["state"] == "idle" and not s["attached"]:
+                        nm_style = "dim"
+                    else:
+                        nm_style = color
                     rows.append(
                         _row(
                             {
@@ -961,21 +1060,17 @@ class Tuimux(App):
                                 "action": "attach",
                                 "open": bool(locs),
                             },
-                            name=(
-                                ("  ", ""),
-                                (s["auto"], f"bold {GREEN}" if s["attached"] else ""),
-                            ),
+                            name=(("  ", ""), (s["auto"], nm_style)),
                             state=((s["state"], _STATE_STYLE.get(s["state"], "")),),
                             uptime=((s["uptime"], "dim"),),
-                            folder=((s["dir"], CYAN),),
-                            tabs=((s["tabs"], "dim"),),
+                            folder=((s["dir"], "dim"),),
+                            tabs=self._tabs_cell(s["tabs"]),
                             open_in=tuple(self._open_in_cell(s, locs))
                             + (
                                 (("  resumed", GREEN),)
                                 if verdicts.get(s["name"]) == "resumed"
                                 else ()
                             ),
-                            agent=(("claude", VIOLET),) if s["agent"] else (),
                         )
                     )
                 # Sessions that were here before the host dropped but didn't come
@@ -1148,6 +1243,31 @@ class Tuimux(App):
         m = self._cur()
         if m and m["host"]:
             self._act(["__awaketoggle", m["host"]])
+
+    def action_orgview(self):
+        # Flip between your own machines and the whole tailnet fleet, then refresh
+        # right away (bypassing the idle/REFRESH gate so the toggle feels instant).
+        self._scope = "org" if self._scope == "mine" else "mine"
+        self.notify(f"{'org fleet' if self._scope == 'org' else 'my machines'}", timeout=2)
+        self._last_refresh = 0.0
+        self._load_hosts()
+
+    def action_login(self):
+        # Set/clear the SSH username tuimux uses for the highlighted host. Works on
+        # any real machine row (the login is per host, not per session).
+        m = self._cur()
+        if not m or not m.get("host") or m.get("consumer"):
+            return
+        host = m["host"]
+        current = _run(["__loginfor", host], timeout=HOSTS_TIMEOUT).stdout.strip()
+
+        def chosen(user):
+            # Empty clears the mapping (engine falls back to $USER); reload either way.
+            self._act(["__setlogin", host, user])
+
+        self.push_screen(
+            Ask(f"SSH login for {host} (blank = default):", current), chosen
+        )
 
 
 def _disposable_tmux_session():

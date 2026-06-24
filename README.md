@@ -32,6 +32,8 @@ tuimux detach               # detach this terminal; the session keeps running
 tuimux autostart on|off|status  # auto-attach EVERY new local terminal to its own session
 tuimux mouse on|off|status  # tmux mouse mode: wheel scrolls the pane, not shell history
 tuimux init <host>          # auto-tmux a remote's SSH logins
+tuimux login [host user]    # show/set the SSH username per host (--rm host to clear)
+tuimux devices              # list every device in the tailnet (the team fleet)
 tuimux doctor               # check setup
 ```
 
@@ -40,6 +42,21 @@ lists the keys). Any tmux session shows up regardless of how it was started. As
 you move the cursor, a panel under the table shows a **live preview** of the
 highlighted session's pane — a read-only glimpse of what it's doing without
 attaching; press **`v`** to hide or show it.
+
+**Shared machines & the team fleet.** By default the dashboard shows your own
+machines. Press **`o`** to toggle the **org fleet view** — every device in the
+tailnet, whoever owns it, with non-compute ones (phones, etc.) grouped as
+status-only. On a shared box where your account isn't your local `$USER` (say you
+log into `herbert` as `mduran`), press **`u`** on that row to set the SSH username
+tuimux connects as — or run `tuimux login herbert mduran`. Once mapped, a host
+always appears in your list (even if a teammate owns it) and tuimux probes it as
+your user, so you see *your* tmux sessions there. Unmapped fleet machines are
+listed but not contacted until you give them a login.
+
+Access stays **passwordless** — tuimux only stores the *username*, never a
+secret. You still need permission to log in: a Tailscale SSH ACL that lets you
+assume that remote user, or your key in that user's `~/.ssh/authorized_keys`.
+Teammates each run their own tuimux, mapping the shared box to their own account.
 
 **`tuimux autostart on`** makes every new terminal you open (any app — Ghostty,
 Terminal.app, GNOME Terminal, …) drop straight into its own fresh tmux session, so
@@ -71,16 +88,14 @@ window happens to be frontmost), or in a new window if you ask for one. If a ses
 is already open on this machine, the menu offers **"go to its tab"** instead of
 opening a duplicate.
 
-**The "OPEN IN" column** reads as two independent facts, `local · host`:
-
-- *local* — where it's open on **this machine**: `this window` (a tab in the
-  dashboard's own window), `other window`, or `—` (not open here).
-- *host* — its live attachment **where it actually runs**: `on host` (one client),
-  `N clients`, or `detached` (no client).
-
-The two can disagree, and that's the point: `— · on host` is a session attached
-from elsewhere (its own console or another device) with no tab here; `this window ·
-detached` is a stale local tab whose connection to the host has dropped.
+**The "OPEN IN" column** tells you where you can reach the session. If it's open
+as a tab on **this machine** it says so and stops — `this window` (a tab in the
+dashboard's own window) or `other window` — because you can just jump to it. If
+it isn't open here (`—`) it reports its attachment **on the host that runs it**:
+`N clients` when something else holds it (e.g. a teammate attached on a shared
+box), or `detached` when nothing is. So `— · 2 clients` is a session you have no
+local tab for but that two clients are in, and `— · detached` is idle and free to
+open fresh.
 
 **When a machine goes offline** (asleep, off the network, or shut down) its sessions
 don't vanish — they stay listed, dimmed, marked **`unreachable`**, showing what was

@@ -569,16 +569,17 @@ def test_view_bold_only_on_identifiers():
         },
     }
     rows = _view_for(hosts, results)
-    bolded = {
-        _cell_text(cells[0]).strip(): True
-        for cells, _ in rows
-        if any("bold" in _cell_styles(cell) for cell in cells)
-    }
-    # online machine name and the attached session are bold; nothing else
-    assert "● me" in bolded
-    assert any(name.endswith("att") for name in bolded)  # attached session
-    assert not any("det" in name for name in bolded)  # detached session not bold
-    assert not any("off" in name for name in bolded)  # offline machine not bold
+
+    def find(label):
+        return next(c for c, _ in rows if label in _cell_text(c[0]))
+
+    me = find("● me")
+    # Only the online machine NAME is bold — not its STATUS word, not sessions.
+    assert "bold" in _cell_styles(me[0])
+    assert "bold" not in _cell_styles(me[1])  # STATUS word not bold
+    assert "bold" not in _cell_styles(find("att")[0])  # attached session not bold
+    assert "bold" not in _cell_styles(find("det")[0])  # detached session not bold
+    assert "bold" not in _cell_styles(find("○ off")[0])  # offline machine not bold
 
 
 def test_view_row_meta_actions():
@@ -734,37 +735,76 @@ def test_open_in_cell():
     a._self_win = "1"
 
     def cell(s):
-        # collapse to "local · host" words, dropping the dim separator/styles
+        # the word tokens, dropping the dim " · " separator
         segs = a._open_in_cell(s, a._window_locs(s["name"]))
-        return (segs[0][0], segs[-1][0])
+        return [seg[0] for seg in segs if seg[0] != " · "]
 
-    # nowhere → "— · detached"
-    assert cell({"name": "x", "attached": False, "nclients": 0}) == ("—", "detached")
-    # open here, one client on host
-    assert cell({"name": "main", "attached": True, "nclients": 1}) == (
-        "this window",
-        "on host",
-    )
-    # open in another local window
-    assert cell({"name": "build", "attached": True, "nclients": 1}) == (
-        "other window",
-        "on host",
-    )
-    # attached on host but no local tab here → "— · on host"
-    assert cell({"name": "zzz", "attached": True, "nclients": 1}) == ("—", "on host")
-    # stale local tab: open here but detached on the host
-    assert cell({"name": "main", "attached": False, "nclients": 0}) == (
-        "this window",
-        "detached",
-    )
-    # open here and also attached elsewhere → "this window · 2 clients"
-    assert cell({"name": "main", "attached": True, "nclients": 2}) == (
-        "this window",
-        "2 clients",
-    )
-    # attached but no client line (e.g. switch-client'd away): host tracks
-    # `attached`, so it stays "on host" rather than disagreeing with the bold name
-    assert cell({"name": "zzz", "attached": True, "nclients": 0}) == ("—", "on host")
+    # a local tab → just that one token; the host attachment is implied
+    assert cell({"name": "main", "attached": True, "nclients": 1}) == ["this window"]
+    assert cell({"name": "build", "attached": True, "nclients": 1}) == ["other window"]
+    # a local tab wins even if the host shows it detached (you can still jump there)
+    assert cell({"name": "main", "attached": False, "nclients": 0}) == ["this window"]
+    # no local tab → "— · <attachment on the owning host>"
+    assert cell({"name": "x", "attached": False, "nclients": 0}) == ["—", "detached"]
+    assert cell({"name": "zzz", "attached": True, "nclients": 1}) == ["—", "1 client"]
+    assert cell({"name": "zzz", "attached": True, "nclients": 2}) == ["—", "2 clients"]
+    # switch-client'd away: attached with no client line → still a held client
+    assert cell({"name": "zzz", "attached": True, "nclients": 0}) == ["—", "1 client"]
+    # we never say "on host" anymore (confusing for local sessions)
+    for s in ({"name": "main", "attached": True, "nclients": 1},
+              {"name": "zzz", "attached": True, "nclients": 3}):
+        words = " ".join(cell(s))
+        assert "on host" not in words
+
+
+def _session(name, **kw):
+    return {
+        "name": name, "auto": name,
+        "attached": kw.get("attached", False),
+        "nclients": kw.get("nclients", 0),
+        "dir": kw.get("dir", "~/p"), "tabs": "1  zsh",
+        "state": kw.get("state", "running"),
+        "uptime": "1h", "created": "1", "agent": kw.get("agent", False),
+    }
+
+
+def test_session_rows_use_device_accent_and_dim_metadata():
+    base = {"reachable": True, "busy": False, "notmux": False, "awake": False}
+    hosts = [("rem", False, "online", "", "compute", "arnau", "", True, "#abcdef")]
+    results = {"rem": {**base, "sessions": [
+        _session("att", attached=True, state="running"),
+        _session("idle1", attached=False, state="idle"),
+        _session("run1", attached=False, state="running"),
+    ]}}
+    rows = _view_for(hosts, results)
+
+    def cells_for(n):
+        return next(c for c, _ in rows if n in _cell_text(c[0]))
+
+    # accent (never bold); idle+unattached → dim; attached/running → plain accent
+    att_name = _cell_styles(cells_for("att")[0])
+    assert "#abcdef" in att_name and "bold" not in att_name
+    assert "dim" in _cell_styles(cells_for("idle1")[0])
+    run_name = _cell_styles(cells_for("run1")[0])
+    assert "#abcdef" in run_name and "bold" not in run_name
+    # folder (col 4) is dim metadata now, not a fixed cyan
+    assert _cell_styles(cells_for("att")[4]) == "dim"
+
+
+def test_waiting_agent_is_amber_working_is_not():
+    base = {"reachable": True, "busy": False, "notmux": False, "awake": False}
+    hosts = [("rem", False, "online", "", "compute", "arnau", "", True, "#abcdef")]
+    results = {"rem": {**base, "sessions": [
+        _session("w", agent=True, state="waiting"),
+        _session("k", agent=True, state="working"),
+    ]}}
+    rows = _view_for(hosts, results)
+    state = {}  # session name → STATE cell styles (col 2)
+    for c, m in rows:
+        if m.get("session") in ("w", "k"):
+            state[m["session"]] = _cell_styles(c[2])
+    assert app.AMBER in state["w"]      # waiting wants you → amber
+    assert app.AMBER not in state["k"]  # working is calm
 
 
 def test_disposable_tmux_session():
@@ -1058,6 +1098,231 @@ def test_peek_with_missing_args_is_an_empty_noop():
     )
     assert r.returncode == 0
     assert r.stdout.strip() == ""
+
+
+# ---- per-host logins + org fleet (engine.sh) --------------------------------
+# A fake `tailscale` (function on PATH-less shell) emitting a canned multi-owner
+# status, so discovery/hosts_data can be exercised without a real tailnet. Self is
+# me@ at 100.0.0.1; herbert/curie are arnau@; phone is an iOS consumer.
+_TS_STUB = r"""tailscale(){ case "$1" in
+  ip) echo 100.0.0.1 ;;
+  status) cat <<'EOF'
+100.0.0.1  mybox     me@      linux  -
+100.0.0.2  herbert   arnau@   linux  -
+100.0.0.3  phone     me@      iOS    -
+100.0.0.4  curie     arnau@   macOS  offline, last seen 2h ago
+EOF
+  ;; esac; }; """
+
+
+def _engine_eval(call, env=None, scope=None):
+    """Source the engine (with a stubbed tailscale) and run a shell `call`,
+    returning its stdout. CONFIG points at /dev/null so a real user config can't
+    leak into the test."""
+    e = {**os.environ, "TUIMUX_CONFIG": "/dev/null"}
+    e.pop("TUIMUX_LOGINS", None)
+    if scope:
+        e["TUIMUX_SCOPE"] = scope
+    if env:
+        e.update(env)
+    script = f"source {app.ENGINE} __login >/dev/null 2>&1; {_TS_STUB} {call}"
+    return subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, env=e
+    ).stdout
+
+
+def _engine_out(args, env=None):
+    e = {**os.environ, "TUIMUX_CONFIG": "/dev/null"}
+    e.pop("TUIMUX_LOGINS", None)
+    if env:
+        e.update(env)
+    return subprocess.run(
+        ["bash", app.ENGINE, *args], capture_output=True, text=True, env=e
+    ).stdout
+
+
+def test_login_for_resolves_mapping_else_default():
+    env = {"TUIMUX_LOGINS": "herbert=mduran nebula=arnaul", "USER": "miquel"}
+    assert _engine_out(["__loginfor", "herbert"], env).strip() == "mduran"
+    assert _engine_out(["__loginfor", "nebula"], env).strip() == "arnaul"
+    assert _engine_out(["__loginfor", "macmini"], env).strip() == "miquel"  # fallback
+
+
+def test_login_cli_set_list_rm_and_validation():
+    with tempfile.TemporaryDirectory() as d:
+        cfg = os.path.join(d, "config")
+        env = {"TUIMUX_CONFIG": cfg, "USER": "miquel"}
+        _engine_out(["login", "herbert", "mduran"], env)
+        _engine_out(["login", "nebula", "mduran"], env)
+        txt = Path(cfg).read_text()
+        assert txt.count("TUIMUX_LOGINS=") == 1  # one line, never duplicated
+        assert "herbert=mduran" in txt and "nebula=mduran" in txt
+        # replacing a host rewrites its token in place, still one line
+        _engine_out(["login", "herbert", "mfrigola"], env)
+        txt = Path(cfg).read_text()
+        assert txt.count("TUIMUX_LOGINS=") == 1
+        assert "herbert=mfrigola" in txt and "herbert=mduran" not in txt
+        # list shows the current mappings
+        listing = _engine_out(["login"], env)
+        assert "herbert" in listing and "mfrigola" in listing
+        # --rm drops just that one
+        _engine_out(["login", "--rm", "herbert"], env)
+        txt = Path(cfg).read_text()
+        assert "herbert=" not in txt and "nebula=mduran" in txt
+        # an invalid token is rejected and leaves the config untouched
+        before = Path(cfg).read_text()
+        r = subprocess.run(
+            ["bash", app.ENGINE, "login", "foo", "bad user"],
+            capture_output=True, text=True, env={**os.environ, **env},
+        )
+        assert r.returncode != 0
+        assert Path(cfg).read_text() == before
+
+
+def test_discover_scope_mine_vs_org():
+    # mine: self + same-owner online peers (phone). org: all online peers, any
+    # owner (+ herbert). curie is offline → never in discover (online-only).
+    mine = _engine_eval("discover_hosts", scope="mine").split()
+    org = _engine_eval("discover_hosts", scope="org").split()
+    assert mine == ["mybox", "phone"]
+    assert set(org) == {"mybox", "herbert", "phone"}
+    assert "curie" not in org
+
+
+def test_discover_includes_mapped_foreign_host():
+    # A teammate-owned host you've mapped a login for shows up even in mine scope.
+    mine = _engine_eval(
+        "discover_hosts", env={"TUIMUX_LOGINS": "herbert=mduran"}, scope="mine"
+    ).split()
+    assert "herbert" in mine
+
+
+def test_hosts_data_columns_owner_mapping_probe():
+    rows = [
+        ln.split("\t")
+        for ln in _engine_eval("hosts_data", scope="org").splitlines()
+    ]
+    by = {r[0]: r for r in rows}
+    # name islocal status lastseen kind owner mapping probe
+    assert by["mybox"][1] == "1" and by["mybox"][5] == "me" and by["mybox"][7] == "1"
+    assert by["phone"][4] == "consumer"
+    # foreign, unmapped → listed but not probed
+    assert by["herbert"][5] == "arnau" and by["herbert"][6] == "" and by["herbert"][7] == "0"
+    assert by["curie"][2] == "offline" and by["curie"][7] == "0"
+    # mapping a foreign host flips it to probe=1 and records the login
+    rows2 = [
+        ln.split("\t")
+        for ln in _engine_eval(
+            "hosts_data", env={"TUIMUX_LOGINS": "herbert=mduran"}, scope="org"
+        ).splitlines()
+    ]
+    h = {r[0]: r for r in rows2}["herbert"]
+    assert h[6] == "mduran" and h[7] == "1"
+
+
+def _view_org(hosts, results):
+    a = app.Tuimux()
+    a._scope = "org"
+    a._hosts = hosts
+    a._results = results
+    return a._view()
+
+
+def test_view_user_column_shows_owner_and_login():
+    base = {"reachable": False, "busy": False, "notmux": False, "awake": False}
+    # full host tuples incl color + resolved login (last two columns)
+    hosts = [
+        ("mybox", True, "online", "", "compute", "miquel", "", True, "#34d8b1", "mduranfrigola"),
+        ("herbert", False, "online", "", "compute", "arnau", "", False, "#73ccde", "mduranfrigola"),
+        ("pujarnol", False, "online", "", "compute", "gemma", "mduran", True, "#d573de", "mduran"),
+    ]
+    results = {
+        "mybox": {**base, "reachable": True, "sessions": []},
+        "pujarnol": {**base, "reachable": True, "sessions": []},
+    }
+    rows = _view_org(hosts, results)
+    user_col = app._COLS.index("user")
+
+    def user_of(label):
+        cells = next(c for c, _ in rows if label in _cell_text(c[0]))
+        return _cell_text(cells[user_col])
+
+    # local: owner + the login we use (differ) — shown even though it's "you"
+    assert "miquel" in user_of("mybox") and "mduranfrigola" in user_of("mybox")
+    # unmapped foreign (no account): owner only, no login spelled out
+    assert user_of("herbert").strip() == "arnau"
+    # mapped foreign: owner + the login we connect as
+    assert "gemma" in user_of("pujarnol") and "mduran" in user_of("pujarnol")
+    # herbert is still the un-probed "no login" hint row
+    herbert = next(c for c, _ in rows if "herbert" in _cell_text(c[0]))
+    assert "no login" in _cell_text(herbert[1])
+
+
+def test_user_cell_never_empty_and_dedupes():
+    uc = app.Tuimux._user_cell
+    # unmapped foreign (no real login) → owner only
+    assert uc("arnau", "mduranfrigola", False, False) == (("arnau", "dim"),)
+    # own/mapped + login differs → both, even when it's your own box
+    assert uc("miquel", "mduranfrigola", True, False) == (("miquel · mduranfrigola", "dim"),)
+    # owner == login → shown once (it's ok for them to be equal)
+    assert uc("arnau", "arnau", True, False) == (("arnau", "dim"),)
+    # consumer device → owner only (no ssh login)
+    assert uc("miquel", "mduranfrigola", True, True) == (("miquel", "dim"),)
+    # nothing known → never blank
+    assert uc("", "", True, False) == (("—", "dim"),)
+
+
+def test_tabs_cell_tints_claude():
+    tc = app.Tuimux._tabs_cell
+    assert tc("1  zsh") == (("1  zsh", "dim"),)
+    agent = tc("2  claude")
+    assert agent[-1] == ("claude", app.VIOLET)  # command tinted violet
+    assert "dim" in agent[0][1]  # the count stays dim
+
+
+def test_view_org_unmapped_row_is_login_actionable():
+    hosts = [("herbert", False, "online", "", "compute", "arnau", "", False)]
+    rows = _view_org(hosts, {})
+    _cells, meta = rows[0]
+    assert meta["host"] == "herbert" and meta["action"] == "machine"
+    assert meta.get("consumer") is False  # u (set login) applies
+
+
+# ---- absolute per-machine colours (engine.sh) -------------------------------
+# Sorted fleet from the stub: curie(0) herbert(1) mybox(2) phone(3).
+def test_fleet_index_follows_sorted_order():
+    assert _engine_eval("fleet_index curie").strip() == "0"
+    assert _engine_eval("fleet_index herbert").strip() == "1"
+    assert _engine_eval("fleet_index phone").strip() == "3"
+
+
+def test_host_color_local_teal_remotes_distinct_and_stable():
+    # mybox is self in the stub → always teal; others get distinct fleet-index hues.
+    assert _engine_eval("host_color mybox").strip() == "#34d8b1"
+    herb = _engine_eval("host_color herbert").strip()
+    phone = _engine_eval("host_color phone").strip()
+    assert re.match(r"^#[0-9a-f]{6}$", herb) and re.match(r"^#[0-9a-f]{6}$", phone)
+    assert herb != phone  # different index → different colour
+    assert _engine_eval("host_color herbert").strip() == herb  # deterministic
+
+
+def test_hosts_data_emits_color_column():
+    rows = [ln.split("\t") for ln in _engine_eval("hosts_data", scope="org").splitlines()]
+    by = {r[0]: r for r in rows}
+    assert by["mybox"][8] == "#34d8b1"  # local → teal
+    assert re.match(r"^#[0-9a-f]{6}$", by["herbert"][8])
+    assert by["herbert"][8] != by["phone"][8]
+
+
+def test_view_uses_engine_color_for_machine_header():
+    # The dashboard must paint the header with the engine-supplied colour (so it
+    # matches the tmux bar), not recompute its own.
+    hosts = [("rem", False, "online", "", "compute", "arnau", "", True, "#abcdef")]
+    base = {"reachable": True, "busy": False, "notmux": False, "awake": False}
+    rows = _view_for(hosts, {"rem": {**base, "sessions": []}})
+    header = rows[0][0]
+    styles = _cell_styles(header[0]) + " " + _cell_styles(header[1])
+    assert "#abcdef" in styles
 
 
 if __name__ == "__main__":

@@ -15,6 +15,9 @@
 #   tuimux mouse on|off       Toggle tmux mouse mode — wheel scrolls the pane, not
 #                  |status     shell history (persists in ~/.tmux.conf)
 #   tuimux init <host>        Make a remote auto-tmux on SSH login (opt-in, asks first)
+#   tuimux login [host user]  Show or set the SSH username per host (for shared
+#                  |--rm host  machines); no args lists, --rm removes one
+#   tuimux devices            List every device in the tailnet (the team fleet)
 #   tuimux doctor             Check local deps + per-host reachability and remote tmux
 #   tuimux -h|--help          This help
 #
@@ -22,7 +25,7 @@
 # dashboard. This script is the engine it calls for discovery, probing, actions.
 #
 # Config (optional): ~/.config/tuimux/config  — see config.example
-#   TUIMUX_HOSTS, TUIMUX_LOGIN, TUIMUX_DEFAULT_SESSION, TUIMUX_SSH_TIMEOUT, TUIMUX_REFRESH
+#   TUIMUX_HOSTS, TUIMUX_LOGIN, TUIMUX_LOGINS, TUIMUX_DEFAULT_SESSION, TUIMUX_SSH_TIMEOUT, TUIMUX_REFRESH
 #
 set -uo pipefail
 
@@ -34,6 +37,12 @@ ENGINE_FILE="$0"
 # ----- defaults / config -----------------------------------------------------
 TUIMUX_HOSTS="${TUIMUX_HOSTS:-}"
 TUIMUX_LOGIN="${TUIMUX_LOGIN:-$USER}"
+# Per-host SSH usernames, for shared machines where your account differs from the
+# default ($USER). A space-separated list of host=user tokens, e.g.
+#   TUIMUX_LOGINS="herbert=mduran nebula=mduran"
+# Plain string (not an associative array) so it works on macOS's bash 3.2. Manage
+# it with `tuimux login`. Unmapped hosts fall back to TUIMUX_LOGIN.
+TUIMUX_LOGINS="${TUIMUX_LOGINS:-}"
 TUIMUX_DEFAULT_SESSION="${TUIMUX_DEFAULT_SESSION:-main}"
 TUIMUX_SSH_TIMEOUT="${TUIMUX_SSH_TIMEOUT:-5}"
 TUIMUX_REFRESH="${TUIMUX_REFRESH:-3}"          # panel auto-refresh interval (seconds)
@@ -151,19 +160,50 @@ self_host() {
 }
 is_local() { [ "$1" = "$(self_host)" ]; }
 
-# Stable per-machine accent colour. MUST mirror app.py _host_color / HOST_PALETTE
-# (same palette + hash) so a session's tmux status bar matches the machine's
-# colour in the dashboard: this machine is always teal; each remote hashes its
-# name into the palette.
+# Canonical tailnet fleet: every device name, sorted — the same absolute, stable
+# ordering on every machine and for every teammate, so a host's accent colour is
+# identical everywhere. Derived from one place (here) and exposed to the dashboard
+# as a hosts_data column, so the UI and the tmux status bar can never disagree.
+fleet_order() {
+  ts_status | awk '$1 ~ /^[0-9]/ && NF>=2 {print $2}' | LC_ALL=C sort -u
+}
+# 0-based position of a host in the fleet ordering (or the count, i.e. "past the
+# end", for a name not in the tailnet — e.g. a TUIMUX_HOSTS-only entry).
+fleet_index() {
+  local h="$1" i=0 name
+  while IFS= read -r name; do
+    [ "$name" = "$h" ] && { printf '%d' "$i"; return; }
+    i=$((i + 1))
+  done <<EOF
+$(fleet_order)
+EOF
+  printf '%d' "$i"
+}
+
+# Stable per-machine accent colour. This machine is always teal; every other host
+# gets its own distinct hue from its fleet index (golden-angle stepping around the
+# colour wheel → adjacent machines look clearly different, and a given host is the
+# same colour everywhere). The dashboard reuses this exact value (hosts_data color
+# column), so a session's tmux status bar always matches its row.
 host_color() {
-  local h="$1" hash=5381 i ch
-  is_local "$h" && { printf '#34d8b1'; return; }
-  local palette=("#7aa2f7" "#b08cff" "#9ece6a" "#56cfe1" "#f7768e" "#ff9e64" "#c678dd")
-  for ((i = 0; i < ${#h}; i++)); do   # djb2, masked to 32 bits to match app.py
-    printf -v ch '%d' "'${h:i:1}"
-    hash=$(((hash * 33 + ch) & 0xFFFFFFFF))
-  done
-  printf '%s' "${palette[hash % ${#palette[@]}]}"
+  is_local "$1" && { printf '#34d8b1'; return; }
+  awk -v i="$(fleet_index "$1")" '
+    function abs(x) { return x < 0 ? -x : x }
+    BEGIN {
+      H = i * 137.508; H = H - int(H / 360) * 360   # golden-angle hue, wrapped to [0,360)
+      S = 0.62; L = 0.66                            # tuned for dark text on the bar
+      C = (1 - abs(2 * L - 1)) * S
+      Hp = H / 60.0
+      X = C * (1 - abs((Hp - 2 * int(Hp / 2)) - 1))
+      m = L - C / 2
+      if      (Hp < 1) { r = C; g = X; b = 0 }
+      else if (Hp < 2) { r = X; g = C; b = 0 }
+      else if (Hp < 3) { r = 0; g = C; b = X }
+      else if (Hp < 4) { r = 0; g = X; b = C }
+      else if (Hp < 5) { r = X; g = 0; b = C }
+      else             { r = C; g = 0; b = X }
+      printf "#%02x%02x%02x", int((r+m)*255+0.5), int((g+m)*255+0.5), int((b+m)*255+0.5)
+    }'
 }
 
 # tmux options tuimux sets on every session it drives, as a "cmd1; cmd2; " prefix
@@ -223,10 +263,41 @@ docker_name() {
   printf '%s-%s' "${adj[RANDOM % ${#adj[@]}]}" "${sci[RANDOM % ${#sci[@]}]}"
 }
 
-# Run a command string on a host — locally if it's this machine, else over SSH.
+# The SSH username to use for a host: its explicit TUIMUX_LOGINS mapping if any,
+# else the global TUIMUX_LOGIN ($USER). Tokens are "host=user"; first match wins.
+login_for() {
+  local host="$1" tok
+  for tok in $TUIMUX_LOGINS; do
+    case "$tok" in "$host="?*) printf '%s' "${tok#*=}"; return ;; esac
+  done
+  printf '%s' "$TUIMUX_LOGIN"
+}
+
+# Just the host names that have an explicit login mapping (one per line). Used by
+# discovery so a mapped shared host always shows up even when it's owned by a
+# teammate (different tailnet owner).
+mapped_host_keys() {
+  local tok
+  for tok in $TUIMUX_LOGINS; do
+    case "$tok" in *=?*) printf '%s\n' "${tok%%=*}" ;; esac
+  done
+}
+
+# The EXPLICIT mapped login for a host, or empty if it has none. Unlike login_for
+# this never falls back to $USER — the dashboard uses the emptiness to tell a real
+# mapping ("connect as gturon") apart from the default.
+mapping_for() {
+  local host="$1" tok
+  for tok in $TUIMUX_LOGINS; do
+    case "$tok" in "$host="?*) printf '%s' "${tok#*=}"; return ;; esac
+  done
+}
+
+# Run a command string on a host — locally if it's this machine, else over SSH
+# as the host's mapped login (login_for).
 rssh() {
   local host="$1"; shift
-  if is_local "$host"; then sh -c "$*"; else ssh "${SSH_OPTS[@]}" "$TUIMUX_LOGIN@$host" "$*"; fi
+  if is_local "$host"; then sh -c "$*"; else ssh "${SSH_OPTS[@]}" "$(login_for "$host")@$host" "$*"; fi
 }
 
 # Abort unless $1 is one of your currently-reachable machines.
@@ -238,23 +309,29 @@ require_reachable_host() {
   err "host '$only' is not in your reachable set:"; printf '%s\n' "$hosts" >&2; exit 1
 }
 
-# Discover this machine's tailnet owner and reachable same-owner peers.
+# Discover reachable peers. Scope (TUIMUX_SCOPE, default "mine"):
+#   mine — your own machines (same tailnet owner) PLUS any host you've mapped a
+#          login for, even if a teammate owns it (so shared boxes you use appear).
+#   org  — every online machine in the tailnet, whoever owns it (the team fleet).
 discover_hosts() {
   if [ -n "$TUIMUX_HOSTS" ]; then
     printf '%s\n' $TUIMUX_HOSTS
     return
   fi
   have tailscale || { err "tailscale not found"; return 1; }
-  local self_ip owner
+  local self_ip owner scope mapped
+  scope="${TUIMUX_SCOPE:-mine}"
   self_ip="$(ts_ip)"
   [ -n "$self_ip" ] || { err "could not determine this machine's tailscale IP"; return 1; }
   owner="$(ts_status | awk -v ip="$self_ip" '$1==ip {print $3; exit}')"
   [ -n "$owner" ] || { err "could not determine your tailnet owner from 'tailscale status'"; return 1; }
+  mapped="$(mapped_host_keys | tr '\n' ' ')"
   printf '%s\n' "$(self_host)"           # this machine first — always reachable
-  ts_status | awk -v ip="$self_ip" -v owner="$owner" '
-    $1!=ip && $3==owner {
-      if ($0 ~ /offline/) next      # skip machines that are not currently up
-      print $2
+  ts_status | awk -v ip="$self_ip" -v owner="$owner" -v scope="$scope" -v mapped="$mapped" '
+    BEGIN { n=split(mapped, a, " "); for (i=1;i<=n;i++) M[a[i]]=1 }
+    $1!=ip {
+      if ($0 ~ /offline/) next                          # only currently-up machines
+      if ($3==owner || scope=="org" || ($2 in M)) print $2
     }'
 }
 
@@ -265,15 +342,18 @@ discover_hosts() {
 offline_hosts() {
   [ -n "$TUIMUX_HOSTS" ] && return 0
   have tailscale || return 0
-  local self_ip owner
+  local self_ip owner scope mapped
+  scope="${TUIMUX_SCOPE:-mine}"
   self_ip="$(ts_ip)"
   [ -n "$self_ip" ] || return 0
   owner="$(ts_status | awk -v ip="$self_ip" '$1==ip {print $3; exit}')"
   [ -n "$owner" ] || return 0
-  ts_status | awk -v ip="$self_ip" -v owner="$owner" '
-    $1!=ip && $3==owner && /offline/ {
-      seen=""; n=index($0, "last seen ")
-      if (n>0) { seen=substr($0, n+10); sub(/[[:space:]]+$/, "", seen) }
+  mapped="$(mapped_host_keys | tr '\n' ' ')"
+  ts_status | awk -v ip="$self_ip" -v owner="$owner" -v scope="$scope" -v mapped="$mapped" '
+    BEGIN { n=split(mapped, a, " "); for (i=1;i<=n;i++) M[a[i]]=1 }
+    $1!=ip && /offline/ && ($3==owner || scope=="org" || ($2 in M)) {
+      seen=""; n2=index($0, "last seen ")
+      if (n2>0) { seen=substr($0, n2+10); sub(/[[:space:]]+$/, "", seen) }
       print $2 "\t" seen
     }'
 }
@@ -284,6 +364,11 @@ offline_hosts() {
 # cached tailscale snapshot.
 host_os() {
   ts_status | awk -v n="$1" '$2==n {print $4; exit}'
+}
+# Tailnet owner of a host (column 3, e.g. "arnau@"), trailing '@' stripped for
+# display. Empty if the host isn't in the snapshot.
+host_owner() {
+  ts_status | awk -v n="$1" '$2==n {o=$3; sub(/@$/,"",o); print o; exit}'
 }
 is_consumer() {
   case "$(host_os "$1" | tr '[:upper:]' '[:lower:]')" in
@@ -318,28 +403,45 @@ done
 true'
 
 # ----- machine-readable backend for the Textual UI ---------------------------
-# List machines as:  host \t islocal(0/1) \t status(online/offline) \t lastseen \t kind
-# kind is "compute" (we SSH into it) or "consumer" (phone/tablet — status only).
-# Reachable same-owner peers first (self leads), then Tailscale-offline ones;
-# the dashboard re-sorts consumer devices to the very end.
+# List machines, tab-separated:
+#   host \t islocal \t status \t lastseen \t kind \t owner \t mapping \t probe \t color \t login
+#   kind    "compute" (we SSH into it) or "consumer" (phone/tablet — status only)
+#   owner   tailnet owner login (e.g. "arnau"), for the org-fleet view
+#   mapping explicit per-host login, or empty (lets the UI tell mapped from default)
+#   probe   1 if tuimux should SSH-probe it (local, your own, or mapped), else 0 —
+#           org-view hosts you have no account on are listed but not probed
+#   color   the machine's accent (host_color) — UI uses it so the tmux bar matches
+#   login   resolved SSH username (login_for) — who we connect as on this host
+# Self leads; Tailscale-offline ones follow; the dashboard re-sorts consumers last.
 hosts_data() {
-  local h hosts name seen me kind
+  local h hosts name seen me myowner kind owner mapping probe color login
   # one tailscale snapshot for the whole call (exported so the subshells below
-  # reuse it via ts_status/ts_ip), and resolve "me" once instead of per host.
+  # reuse it via ts_status/ts_ip), and resolve "me"/owner once instead of per host.
   export _EOS_TS_STATUS _EOS_TS_IP
   _EOS_TS_STATUS="$(tailscale status 2>/dev/null)"
   _EOS_TS_IP="$(tailscale ip -4 2>/dev/null | head -1)"
   hosts="$(discover_hosts)" || return 1
   me="$(self_host)"
+  myowner="$(host_owner "$me")"
   for h in $hosts; do
     is_consumer "$h" && kind=consumer || kind=compute
-    [ "$h" = "$me" ] && printf '%s\t1\tonline\t\t%s\n' "$h" "$kind" \
-                     || printf '%s\t0\tonline\t\t%s\n' "$h" "$kind"
+    owner="$(host_owner "$h")"; [ -n "$owner" ] || owner="$myowner"
+    mapping="$(mapping_for "$h")"
+    color="$(host_color "$h")"
+    login="$(login_for "$h")"
+    # probe our own machines + anything we've mapped a login for; skip the rest
+    if [ "$h" = "$me" ] || [ "$owner" = "$myowner" ] || [ -n "$mapping" ]; then probe=1; else probe=0; fi
+    [ "$h" = "$me" ] && printf '%s\t1\tonline\t\t%s\t%s\t%s\t%s\t%s\t%s\n' "$h" "$kind" "$owner" "$mapping" "$probe" "$color" "$login" \
+                     || printf '%s\t0\tonline\t\t%s\t%s\t%s\t%s\t%s\t%s\n' "$h" "$kind" "$owner" "$mapping" "$probe" "$color" "$login"
   done
   offline_hosts | while IFS="$(printf '\t')" read -r name seen; do
     [ -n "$name" ] || continue
     is_consumer "$name" && kind=consumer || kind=compute
-    printf '%s\t0\toffline\t%s\t%s\n' "$name" "$seen" "$kind"
+    owner="$(host_owner "$name")"; [ -n "$owner" ] || owner="$myowner"
+    mapping="$(mapping_for "$name")"
+    color="$(host_color "$name")"
+    login="$(login_for "$name")"
+    printf '%s\t0\toffline\t%s\t%s\t%s\t%s\t0\t%s\t%s\n' "$name" "$seen" "$kind" "$owner" "$mapping" "$color" "$login"
   done
 }
 
@@ -378,7 +480,7 @@ do_attach() {
   else
     # Force a portable TERM so remote tmux doesn't choke on xterm-ghostty.
     surface "$mode" env TERM="$TUIMUX_REMOTE_TERM" \
-      ssh -t "${SSH_OPTS[@]}" "$TUIMUX_LOGIN@$host" "$cmd"
+      ssh -t "${SSH_OPTS[@]}" "$(login_for "$host")@$host" "$cmd"
   fi
 }
 
@@ -433,7 +535,7 @@ tmux_browse() {            # runs inside the spawned tab; takes it over into tmu
   cmd='t=$(tmux ls -F "#{session_name}" 2>/dev/null | grep -vx "'"$AWAKE_SESSION"'" | head -n1)
 if [ -n "$t" ]; then exec tmux attach -t "$t" \; choose-tree -Zs; else exec tmux attach \; choose-tree -Zs; fi'
   if is_local "$host"; then exec sh -c "$cmd"
-  else exec env TERM="$TUIMUX_REMOTE_TERM" ssh -t "${SSH_OPTS[@]}" "$TUIMUX_LOGIN@$host" "$cmd"; fi
+  else exec env TERM="$TUIMUX_REMOTE_TERM" ssh -t "${SSH_OPTS[@]}" "$(login_for "$host")@$host" "$cmd"; fi
 }
 
 # Open the Tailscale admin console (machines page) in the default browser —
@@ -910,7 +1012,7 @@ init_host() {
   case "$ans" in y|Y|yes|YES) ;; *) note "aborted — nothing changed."; return 1 ;; esac
   if printf '%s\n' "$snippet" | rssh "$host" "cat >> '$rc'"; then
     note "done — new SSH logins to $host will auto-attach to tmux '$TUIMUX_DEFAULT_SESSION'."
-    note "skip it for one session with:  TUIMUX_NO_AUTOTMUX=1 ssh $TUIMUX_LOGIN@$host"
+    note "skip it for one session with:  TUIMUX_NO_AUTOTMUX=1 ssh $(login_for "$host")@$host"
   else
     err "failed to write $rc on $host"; exit 1
   fi
@@ -1147,7 +1249,10 @@ doctor() {
   self_ip="$(tailscale ip -4 2>/dev/null | head -1)"
   owner="$(tailscale status 2>/dev/null | awk -v ip="$self_ip" '$1==ip {print $3; exit}')"
   printf 'this machine: %s  (owner %s)\n' "${self_ip:-?}" "${owner:-?}"
-  printf 'login user:   %s\n' "$TUIMUX_LOGIN"
+  printf 'login user:   %s  (default; unmapped hosts use this)\n' "$TUIMUX_LOGIN"
+  if [ -n "$TUIMUX_LOGINS" ]; then
+    printf 'per-host:     %s\n' "$TUIMUX_LOGINS"
+  fi
   # how this machine will open sessions in new terminal surfaces
   if [ "$(os_kind)" = linux ]; then
     local lt ld jump
@@ -1181,11 +1286,89 @@ doctor() {
     fi
     probe="$(rssh "$h" 'command -v tmux >/dev/null 2>&1 && echo tmux-ok || echo tmux-missing' 2>/dev/null)"
     case "$probe" in
-      tmux-ok)      printf '  [ok]   %-15s ssh + tmux\n' "$h" ;;
-      tmux-missing) printf '  [warn] %-15s ssh ok, tmux NOT installed\n' "$h" ;;
-      *)            printf '  [FAIL] %-15s no Tailscale SSH (run "sudo tailscale up --ssh" there + check ACLs)\n' "$h" ;;
+      tmux-ok)      printf '  [ok]   %-15s ssh + tmux  (as %s)\n' "$h" "$(login_for "$h")" ;;
+      tmux-missing) printf '  [warn] %-15s ssh ok, tmux NOT installed  (as %s)\n' "$h" "$(login_for "$h")" ;;
+      *)            printf '  [FAIL] %-15s no Tailscale SSH as %s (run "sudo tailscale up --ssh" there + check ACLs)\n' "$h" "$(login_for "$h")" ;;
     esac
   done
+}
+
+# A flat catalog of every device in the tailnet (whoever owns it), up or down —
+# the team fleet at a glance, without launching the dashboard.
+cmd_devices() {
+  have tailscale || { err "tailscale not found"; exit 1; }
+  printf '%-22s %-10s %-9s %-6s %s\n' HOST OWNER OS STATE 'LAST SEEN'
+  tailscale status 2>/dev/null | awk '
+    $1=="" { next }
+    {
+      host=$2; owner=$3; sub(/@$/,"",owner); os=$4
+      state="up"; seen=""
+      if ($0 ~ /offline/) {
+        state="down"; n=index($0,"last seen ")
+        if (n>0) { seen=substr($0,n+10); sub(/[[:space:]]+$/,"",seen) }
+      }
+      printf "%-22s %-10s %-9s %-6s %s\n", host, owner, os, state, seen
+    }'
+}
+
+# ----- per-host logins -------------------------------------------------------
+# Persist KEY="VALUE" into the config file, creating it (and its dir) if needed
+# and replacing any existing assignment so the line never duplicates. VALUE is
+# only ever the validated, space-joined login map, so plain double-quoting is safe.
+set_config_kv() {
+  local key="$1" val="$2" tmp
+  mkdir -p "$(dirname "$CONFIG_FILE")" 2>/dev/null || true
+  [ -f "$CONFIG_FILE" ] || : > "$CONFIG_FILE"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/tuimux.XXXXXX")" || { err "could not write config"; return 1; }
+  awk -v k="$key" -v v="$val" '$0 ~ "^"k"=" {next} {print} END {print k"=\""v"\""}' \
+    "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+}
+
+# A login token must be a bare host/user name — no spaces, '=', or quotes — so it
+# round-trips safely through the space-separated, '='-delimited TUIMUX_LOGINS map.
+valid_login_token() { case "$1" in ""|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
+
+# Current TUIMUX_LOGINS with the given host's mapping dropped (space-separated).
+logins_without() {
+  local drop="$1" tok out=""
+  for tok in $TUIMUX_LOGINS; do
+    case "$tok" in "$drop="*) ;; *=?*) out="$out${out:+ }$tok" ;; esac
+  done
+  printf '%s' "$out"
+}
+
+# `tuimux login` — manage the per-host SSH username map (TUIMUX_LOGINS).
+#   tuimux login                  list current mappings
+#   tuimux login <host> <user>    set/replace one
+#   tuimux login --rm <host>      remove one
+cmd_login() {
+  local tok host user
+  case "${1:-}" in
+    "")
+      if [ -z "$TUIMUX_LOGINS" ]; then
+        printf 'No per-host logins set — every host uses "%s".\n' "$TUIMUX_LOGIN"
+      else
+        printf 'Per-host SSH logins (unmapped hosts use "%s"):\n' "$TUIMUX_LOGIN"
+        for tok in $TUIMUX_LOGINS; do
+          case "$tok" in *=?*) printf '  %-20s %s\n' "${tok%%=*}" "${tok#*=}" ;; esac
+        done
+      fi ;;
+    --rm)
+      host="${2:-}"
+      [ -n "$host" ] || { err "usage: tuimux login --rm <host>"; exit 1; }
+      set_config_kv TUIMUX_LOGINS "$(logins_without "$host")" \
+        && note "removed login mapping for $host"
+      ;;
+    *)
+      host="$1"; user="${2:-}"
+      [ -n "$user" ] || { err "usage: tuimux login <host> <user>"; exit 1; }
+      valid_login_token "$host" || { err "invalid host name: '$host'"; exit 1; }
+      valid_login_token "$user" || { err "invalid user name: '$user'"; exit 1; }
+      local base; base="$(logins_without "$host")"
+      set_config_kv TUIMUX_LOGINS "${base:+$base }$host=$user" \
+        && note "set $host → $user"
+      ;;
+  esac
 }
 
 # ----- dispatch --------------------------------------------------------------
@@ -1195,12 +1378,17 @@ case "${1:-}" in
   autostart     ) shift; autostart "${1:-}" ;;
   mouse         ) shift; mouse "${1:-status}" ;;
   init          ) shift; init_host "${1:-}" ;;
+  login         ) shift; cmd_login "$@" ;;
+  devices       ) cmd_devices ;;
   doctor        ) doctor ;;
   # ----- backend called by the Textual UI -----
-  __hosts       ) hosts_data ;;
+  __hosts       ) shift; [ "${1:-}" = org ] && export TUIMUX_SCOPE=org; hosts_data ;;
   __probe       ) shift; probe_host "${1:-}" ;;
   __peek        ) shift; peek_pane "${1:-}" "${2:-}" ;;
   __login       ) printf '%s\n' "$TUIMUX_LOGIN" ;;
+  __loginfor    ) shift; login_for "${1:-}"; echo ;;
+  # set a mapping (host user); an empty user removes it
+  __setlogin    ) shift; if [ -n "${2:-}" ]; then cmd_login "${1:-}" "${2:-}" >/dev/null 2>&1; else cmd_login --rm "${1:-}" >/dev/null 2>&1; fi ;;
   __attach      ) shift; do_attach "${1:-}" "${2:-}" "${3:-}" exec ;;
   __open        ) shift; open_surface "${1:-}" "${2:-}" "${3:-}" "${4:-}" ;;
   __detach      ) shift; detach_session "${1:-}" "${2:-}" ;;

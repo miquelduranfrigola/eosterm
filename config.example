@@ -8,6 +8,11 @@
 # Remote login user for Tailscale SSH. Defaults to your local $USER.
 # TUIMUX_LOGIN="mduranfrigola"
 
+# Per-host SSH usernames, for shared machines where your account isn't $USER.
+# Space-separated host=user tokens; unmapped hosts fall back to TUIMUX_LOGIN.
+# Manage it from the dashboard (press u) or with `tuimux login <host> <user>`.
+# TUIMUX_LOGINS="herbert=mduran nebula=mduran"
+
 # Session name used when you create one without naming it.
 # TUIMUX_DEFAULT_SESSION="main"
 
