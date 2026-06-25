@@ -510,14 +510,13 @@ class Tuimux(App):
     ModalScreen { align: center middle; background: $background 70%; }
     """
 
-    # Footer order: enter (shown by SessionTable) space w n d x t c r a q
+    # Footer order: enter (shown by SessionTable) space w n d x v o u c r a q
     BINDINGS = [
         Binding("space", "menu", "menu"),
         Binding("w", "window", "new window"),
         Binding("n", "rename", "rename"),
         Binding("d", "detach", "detach"),
         Binding("x", "close", "close"),
-        Binding("t", "tmux", "tmux tree"),
         Binding("v", "preview", "preview"),
         Binding("o", "orgview", "org fleet"),
         Binding("u", "login", "set login"),
@@ -1240,11 +1239,6 @@ class Tuimux(App):
                     self._act(["__renameto", m["host"], m["session"], name])
 
             self.push_screen(Ask(f"Rename “{m['session']}” to:", m["session"]), renamed)
-
-    def action_tmux(self):
-        m = self._cur()
-        if m and m["host"]:
-            self._spawn(["__openbrowse", m["host"]])
 
     def action_console(self):
         # open the Tailscale admin console in the browser — no row needed
