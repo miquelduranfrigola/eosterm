@@ -618,8 +618,10 @@ class Tuimux(App):
             # "resumed" marker can append on a just-reconnected (detached) session.
             ("OPEN IN", "open", 18),
             # the machine's owner and the login we connect as (gray); blank on
-            # session rows. "miquel · mduranfrigola" is the long case.
-            ("USER", "user", 22),
+            # session rows. width=None → auto-size to content so a long
+            # "owner · login" is never cropped (it's the last column, so growing it
+            # just extends the table to the right).
+            ("USER", "user", None),
         ):
             t.add_column(col, key=key, width=w)
         t.focus()
