@@ -61,6 +61,18 @@ CYAN = "#56cfe1"  # folders
 VIOLET = "#b08cff"  # agent
 AMBER = "#e0af68"  # awake / waiting / no-ssh
 GREEN = "#9ece6a"  # active session / running / working
+MUTED = "#565f89"  # gray (offline status dot)
+
+
+def _marker(state):
+    """The bold status dot in front of a machine's NAME — connection at a glance:
+    ● green = reachable over SSH, ● orange = online but no usable SSH, ○ gray =
+    offline. Always bold."""
+    if state == "ssh":
+        return ("● ", f"bold {GREEN}")
+    if state == "online":  # online on the tailnet, but no working SSH
+        return ("● ", f"bold {AMBER}")
+    return ("○ ", f"bold {MUTED}")  # offline
 
 # Per-session STATE word → colour. Only the one state that *wants you* (a waiting
 # agent) gets a colour — amber. Everything else is plain or dim, so the device's
@@ -641,11 +653,8 @@ class Tuimux(App):
             wrap = self.query_one("#table-wrap")
         except Exception:
             return
-        # Keep the "press u" hint last: the subtitle is right-aligned, so on a
-        # narrow terminal the settings get clipped first and the hint stays visible.
         wrap.border_subtitle = (
             f"autostart: {auto or 'off'}  ·  mouse scroll: {mouse or 'off'}"
-            "  ·  press u to set the SSH login"
         )
 
     @work(thread=True)
@@ -895,8 +904,9 @@ class Tuimux(App):
     #   accent → the device's own colour, used as the identity thread: its machine
     #            NAME/STATUS *and* its session NAMEs. Within a device block this is
     #            the only hue — so each device reads as one calm colour family.
-    #   bold   → the machine (device) NAME only. Nothing else is bold — not the
-    #            STATUS word, not session names.
+    #   bold   → the machine (device) NAME and its status dot (the dot is always
+    #            bold; green=ssh, orange=online/no-ssh, hollow=offline). Nothing
+    #            else is bold — not the STATUS word, not session names.
     #   amber  → the one thing that wants you: an agent STATE of "waiting" (plus
     #            keep-awake / no-ssh markers). Kept rare so it actually pops.
     #   violet → "claude" inside the TABS column (the active window is an AI agent).
@@ -930,7 +940,7 @@ class Tuimux(App):
                     rows.append(
                         _row(
                             dead,
-                            name=(("○ ", "dim"), (host, "dim")),
+                            name=(_marker("offline"), (host, "dim")),
                             status=(("offline", "dim italic"),),
                             state=((seen, "dim"),) if seen else (),
                             user=user,
@@ -940,49 +950,27 @@ class Tuimux(App):
                     rows.append(
                         _row(
                             dead,
-                            name=(("● ", "dim"), (host, "dim")),
+                            name=(_marker("online"), (host, "dim")),
                             status=(("online", "dim"),),
                             user=user,
                         )
                     )
-            elif not want_probe:
-                # Org-fleet view: a teammate's machine we have no account on. Listed
-                # so you can see it, but never SSH'd — press u to map a login and it
-                # becomes a real, probed host.
-                rows.append(
-                    _row(
-                        machine,
-                        name=(("○ ", "dim"), (host, "dim")),
-                        status=(("no login", "dim italic"),),
-                        folder=(("press u to set a login", "dim"),),
-                        user=user,
-                    )
-                )
-            elif info is None:
-                # not probed yet this session — neutral placeholder, no waiting
-                rows.append(
-                    _row(
-                        machine,
-                        name=(("● ", "dim"), (host, "dim")),
-                        status=(("checking…", "dim italic"),),
-                        user=user,
-                    )
-                )
-            elif not info["reachable"] and status == "offline":
-                seen = info.get("lastseen", "")
+            elif status == "offline":
+                # Down (asleep / off the network / shut down): a hollow dot + last
+                # seen. Decided by tailscale status, not by a probe — offline hosts
+                # aren't probed, so info stays None for them.
                 rows.append(
                     _row(
                         dead,
-                        name=(("○ ", "dim"), (host, "dim")),
+                        name=(_marker("offline"), (host, "dim")),
                         status=(("offline", "dim italic"),),
-                        state=((seen, "dim"),) if seen else (),
+                        state=((_lastseen, "dim"),) if _lastseen else (),
                         user=user,
                     )
                 )
-                # The host is down, but its tmux sessions almost certainly are
-                # not — they're just out of reach until it comes back. Show what
-                # was last running, dimmed, so you know what's "paused" (whether
-                # they actually survive only becomes truthful at reconnect; see
+                # Its tmux sessions almost certainly aren't gone — just out of reach
+                # until it's back. Show what was last running, dimmed, so you know
+                # what's "paused" (truth only becomes knowable at reconnect; see
                 # _reconcile_sessions). Non-interactive: there's nothing to attach.
                 for s in self._snap.get(host, []):
                     rows.append(
@@ -995,12 +983,35 @@ class Tuimux(App):
                             open_in=(("unreachable", "dim italic"),),
                         )
                     )
-            elif not info["reachable"] and info.get("busy"):
+            elif not want_probe:
+                # Org-fleet view: a teammate's machine we have no account on. Listed
+                # so you can see it, but never SSH'd — press u to map a login and it
+                # becomes a real, probed host.
+                rows.append(
+                    _row(
+                        machine,
+                        name=(_marker("online"), (host, "dim")),
+                        status=(("no login", "dim italic"),),
+                        folder=(("press u to set a login", "dim"),),
+                        user=user,
+                    )
+                )
+            elif info is None:
+                # not probed yet this session — neutral placeholder, no waiting
+                rows.append(
+                    _row(
+                        machine,
+                        name=(_marker("online"), (host, "dim")),
+                        status=(("checking…", "dim italic"),),
+                        user=user,
+                    )
+                )
+            elif info.get("busy"):
                 # SSH works, the host is just too loaded to answer in time.
                 rows.append(
                     _row(
                         dead,
-                        name=(("◐ ", AMBER), (host, f"bold {AMBER}")),
+                        name=(_marker("online"), (host, f"bold {AMBER}")),
                         status=(("busy", AMBER),),
                         folder=(("high load — slow to respond", "dim"),),
                         user=user,
@@ -1012,7 +1023,7 @@ class Tuimux(App):
                 rows.append(
                     _row(
                         dead,
-                        name=(("◐ ", AMBER), (host, f"bold {AMBER}")),
+                        name=(_marker("online"), (host, f"bold {AMBER}")),
                         status=(("no ssh", AMBER),),
                         folder=(("tailscale up --ssh", "dim"),),
                         user=user,
@@ -1028,7 +1039,7 @@ class Tuimux(App):
                 rows.append(
                     _row(
                         machine,
-                        name=(("● ", color), (host, f"bold {color}")),
+                        name=(_marker("ssh"), (host, f"bold {color}")),
                         status=(word,),
                         state=(("☕ awake", AMBER),) if info["awake"] else (),
                         user=user,
