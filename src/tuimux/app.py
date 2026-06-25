@@ -74,6 +74,7 @@ def _marker(state):
         return ("● ", f"bold {AMBER}")
     return ("○ ", f"bold {MUTED}")  # offline
 
+
 # Per-session STATE word → colour. Only the one state that *wants you* (a waiting
 # agent) gets a colour — amber. Everything else is plain or dim, so the device's
 # own accent stays the dominant colour in its block and amber actually stands out.
@@ -164,7 +165,18 @@ def fetch_hosts(scope="mine"):
         # resolved SSH username (login_for) — who we connect as on this host.
         login = parts[9].strip() if len(parts) > 9 else ""
         res.append(
-            (name, is_local, status, lastseen, kind, owner, mapping, probe, color, login)
+            (
+                name,
+                is_local,
+                status,
+                lastseen,
+                kind,
+                owner,
+                mapping,
+                probe,
+                color,
+                login,
+            )
         )
     # Order: your own machines first (so the fleet view still opens on you), then
     # other owners grouped together, consumers (phones/tablets) always last. Stable
@@ -927,8 +939,11 @@ class Tuimux(App):
             info = self._results.get(host)
             consumer = kind == "consumer"
             machine = {
-                "host": host, "session": None, "action": "machine",
-                "consumer": consumer, "mapping": mapping,
+                "host": host,
+                "session": None,
+                "action": "machine",
+                "consumer": consumer,
+                "mapping": mapping,
             }
             dead = {**machine, "action": "none"}
             # The USER cell (gray) goes on every machine header: the owner, plus the
@@ -1255,7 +1270,9 @@ class Tuimux(App):
         # Flip between your own machines and the whole tailnet fleet, then refresh
         # right away (bypassing the idle/REFRESH gate so the toggle feels instant).
         self._scope = "org" if self._scope == "mine" else "mine"
-        self.notify(f"{'org fleet' if self._scope == 'org' else 'my machines'}", timeout=2)
+        self.notify(
+            f"{'org fleet' if self._scope == 'org' else 'my machines'}", timeout=2
+        )
         self._last_refresh = 0.0
         self._load_hosts()
 

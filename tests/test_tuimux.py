@@ -758,31 +758,42 @@ def test_open_in_cell():
     # switch-client'd away: attached with no client line → still a held client
     assert cell({"name": "zzz", "attached": True, "nclients": 0}) == ["—", "1 client"]
     # we never say "on host" anymore (confusing for local sessions)
-    for s in ({"name": "main", "attached": True, "nclients": 1},
-              {"name": "zzz", "attached": True, "nclients": 3}):
+    for s in (
+        {"name": "main", "attached": True, "nclients": 1},
+        {"name": "zzz", "attached": True, "nclients": 3},
+    ):
         words = " ".join(cell(s))
         assert "on host" not in words
 
 
 def _session(name, **kw):
     return {
-        "name": name, "auto": name,
+        "name": name,
+        "auto": name,
         "attached": kw.get("attached", False),
         "nclients": kw.get("nclients", 0),
-        "dir": kw.get("dir", "~/p"), "tabs": "1  zsh",
+        "dir": kw.get("dir", "~/p"),
+        "tabs": "1  zsh",
         "state": kw.get("state", "running"),
-        "uptime": "1h", "created": "1", "agent": kw.get("agent", False),
+        "uptime": "1h",
+        "created": "1",
+        "agent": kw.get("agent", False),
     }
 
 
 def test_session_rows_use_device_accent_and_dim_metadata():
     base = {"reachable": True, "busy": False, "notmux": False, "awake": False}
     hosts = [("rem", False, "online", "", "compute", "arnau", "", True, "#abcdef")]
-    results = {"rem": {**base, "sessions": [
-        _session("att", attached=True, state="running"),
-        _session("idle1", attached=False, state="idle"),
-        _session("run1", attached=False, state="running"),
-    ]}}
+    results = {
+        "rem": {
+            **base,
+            "sessions": [
+                _session("att", attached=True, state="running"),
+                _session("idle1", attached=False, state="idle"),
+                _session("run1", attached=False, state="running"),
+            ],
+        }
+    }
     rows = _view_for(hosts, results)
 
     def cells_for(n):
@@ -801,16 +812,21 @@ def test_session_rows_use_device_accent_and_dim_metadata():
 def test_waiting_agent_is_amber_working_is_not():
     base = {"reachable": True, "busy": False, "notmux": False, "awake": False}
     hosts = [("rem", False, "online", "", "compute", "arnau", "", True, "#abcdef")]
-    results = {"rem": {**base, "sessions": [
-        _session("w", agent=True, state="waiting"),
-        _session("k", agent=True, state="working"),
-    ]}}
+    results = {
+        "rem": {
+            **base,
+            "sessions": [
+                _session("w", agent=True, state="waiting"),
+                _session("k", agent=True, state="working"),
+            ],
+        }
+    }
     rows = _view_for(hosts, results)
     state = {}  # session name → STATE cell styles (col 2)
     for c, m in rows:
         if m.get("session") in ("w", "k"):
             state[m["session"]] = _cell_styles(c[2])
-    assert app.AMBER in state["w"]      # waiting wants you → amber
+    assert app.AMBER in state["w"]  # waiting wants you → amber
     assert app.AMBER not in state["k"]  # working is calm
 
 
@@ -1180,7 +1196,9 @@ def test_login_cli_set_list_rm_and_validation():
         before = Path(cfg).read_text()
         r = subprocess.run(
             ["bash", app.ENGINE, "login", "foo", "bad user"],
-            capture_output=True, text=True, env={**os.environ, **env},
+            capture_output=True,
+            text=True,
+            env={**os.environ, **env},
         )
         assert r.returncode != 0
         assert Path(cfg).read_text() == before
@@ -1206,15 +1224,18 @@ def test_discover_includes_mapped_foreign_host():
 
 def test_hosts_data_columns_owner_mapping_probe():
     rows = [
-        ln.split("\t")
-        for ln in _engine_eval("hosts_data", scope="org").splitlines()
+        ln.split("\t") for ln in _engine_eval("hosts_data", scope="org").splitlines()
     ]
     by = {r[0]: r for r in rows}
     # name islocal status lastseen kind owner mapping probe
     assert by["mybox"][1] == "1" and by["mybox"][5] == "me" and by["mybox"][7] == "1"
     assert by["phone"][4] == "consumer"
     # foreign, unmapped → listed but not probed
-    assert by["herbert"][5] == "arnau" and by["herbert"][6] == "" and by["herbert"][7] == "0"
+    assert (
+        by["herbert"][5] == "arnau"
+        and by["herbert"][6] == ""
+        and by["herbert"][7] == "0"
+    )
     assert by["curie"][2] == "offline" and by["curie"][7] == "0"
     # mapping a foreign host flips it to probe=1 and records the login
     rows2 = [
@@ -1239,9 +1260,42 @@ def test_view_user_column_shows_owner_and_login():
     base = {"reachable": False, "busy": False, "notmux": False, "awake": False}
     # full host tuples incl color + resolved login (last two columns)
     hosts = [
-        ("mybox", True, "online", "", "compute", "miquel", "", True, "#34d8b1", "mduranfrigola"),
-        ("herbert", False, "online", "", "compute", "arnau", "", False, "#73ccde", "mduranfrigola"),
-        ("pujarnol", False, "online", "", "compute", "gemma", "mduran", True, "#d573de", "mduran"),
+        (
+            "mybox",
+            True,
+            "online",
+            "",
+            "compute",
+            "miquel",
+            "",
+            True,
+            "#34d8b1",
+            "mduranfrigola",
+        ),
+        (
+            "herbert",
+            False,
+            "online",
+            "",
+            "compute",
+            "arnau",
+            "",
+            False,
+            "#73ccde",
+            "mduranfrigola",
+        ),
+        (
+            "pujarnol",
+            False,
+            "online",
+            "",
+            "compute",
+            "gemma",
+            "mduran",
+            True,
+            "#d573de",
+            "mduran",
+        ),
     ]
     results = {
         "mybox": {**base, "reachable": True, "sessions": []},
@@ -1270,7 +1324,9 @@ def test_user_cell_never_empty_and_dedupes():
     # unmapped foreign (no real login) → owner only
     assert uc("arnau", "mduranfrigola", False, False) == (("arnau", "dim"),)
     # own/mapped + login differs → both, even when it's your own box
-    assert uc("miquel", "mduranfrigola", True, False) == (("miquel · mduranfrigola", "dim"),)
+    assert uc("miquel", "mduranfrigola", True, False) == (
+        ("miquel · mduranfrigola", "dim"),
+    )
     # owner == login → shown once (it's ok for them to be equal)
     assert uc("arnau", "arnau", True, False) == (("arnau", "dim"),)
     # consumer device → owner only (no ssh login)
@@ -1315,7 +1371,18 @@ def test_offline_host_with_probe_zero_renders_offline():
     # Offline hosts come back with probe=0 and are never probed (info stays None),
     # so the offline branch must win over "no login"/"checking" — decided by status.
     hosts = [
-        ("down", False, "offline", "3h ago", "compute", "gemma", "", False, "#b08cff", "me")
+        (
+            "down",
+            False,
+            "offline",
+            "3h ago",
+            "compute",
+            "gemma",
+            "",
+            False,
+            "#b08cff",
+            "me",
+        )
     ]
     rows = _view_for(hosts, {})  # no probe result
     cells, meta = rows[0]
@@ -1352,7 +1419,9 @@ def test_host_color_local_teal_remotes_distinct_and_stable():
 
 
 def test_hosts_data_emits_color_column():
-    rows = [ln.split("\t") for ln in _engine_eval("hosts_data", scope="org").splitlines()]
+    rows = [
+        ln.split("\t") for ln in _engine_eval("hosts_data", scope="org").splitlines()
+    ]
     by = {r[0]: r for r in rows}
     assert by["mybox"][8] == "#34d8b1"  # local → teal
     assert re.match(r"^#[0-9a-f]{6}$", by["herbert"][8])
