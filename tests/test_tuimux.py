@@ -17,7 +17,8 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from tuimux import app  # noqa: E402
-from tuimux.cli import tuimux_bin  # noqa: E402
+from tuimux import cli  # noqa: E402
+from tuimux.cli import relaunch_argv, tuimux_bin  # noqa: E402
 
 
 @contextlib.contextmanager
@@ -86,6 +87,22 @@ def test_auto_name():
 def test_tuimux_bin_is_absolute_or_name():
     got = tuimux_bin()
     assert got == "tuimux" or got.endswith("tuimux")
+
+
+def test_relaunch_argv_falls_back_to_module_when_no_console_script(monkeypatch):
+    # When tuimux is launched as `python -m tuimux` there's no console script on
+    # PATH, so tuimux_bin() returns the bare name "tuimux". The relaunch must NOT
+    # use that bare name — under tmux's detach-client -E it runs in a non-login
+    # shell whose PATH lacks the venv, so it'd be `command not found` and freeze
+    # the terminal. Fall back to the current interpreter + module instead.
+    monkeypatch.setattr(cli, "tuimux_bin", lambda: "tuimux")
+    assert relaunch_argv() == [sys.executable, "-m", "tuimux"]
+
+
+def test_relaunch_argv_uses_resolved_console_script(monkeypatch):
+    # An installed console script (a real absolute path) is used verbatim.
+    monkeypatch.setattr(cli, "tuimux_bin", lambda: sys.executable)
+    assert relaunch_argv() == [sys.executable]
 
 
 # ---- CLI: attach / detach (replaced the old `here`) -------------------------
@@ -924,6 +941,22 @@ def test_run_inside_tmux_kills_disposable_session():
     # kills the throwaway session first, then relaunches the dashboard
     assert handoff.index("kill-session -t happy-curie") < handoff.index("exec")
     assert "TUIMUX_NO_AUTOTMUX=1" in handoff
+
+
+def test_run_inside_tmux_handoff_is_runnable_for_python_m_launch(monkeypatch):
+    # Regression: launched as `python -m tuimux`, the relaunch must be a real
+    # runnable command (`<python> -m tuimux`) with each token quoted separately —
+    # not a single bogus "python -m tuimux" word, and never the bare `tuimux`
+    # that froze the terminal under detach-client -E.
+    monkeypatch.setattr(
+        app, "relaunch_argv", lambda: ["/opt/py/python3", "-m", "tuimux"]
+    )
+    with _patched_run(returncode=0, tmux="x") as (calls, launched):
+        app.run()
+    assert launched == []
+    handoff = _detach_cmd(calls)[3]
+    assert "exec /opt/py/python3 -m tuimux" in handoff
+    assert "'/opt/py/python3 -m tuimux'" not in handoff  # not collapsed to one token
 
 
 def test_run_inside_tmux_falls_back_when_detach_fails():

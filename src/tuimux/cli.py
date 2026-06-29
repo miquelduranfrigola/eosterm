@@ -47,6 +47,26 @@ def tuimux_bin() -> str:
     return shutil.which("tuimux") or "tuimux"
 
 
+def relaunch_argv() -> list[str]:
+    """A concrete argv that re-launches the dashboard and is guaranteed to run
+    regardless of how tuimux was started.
+
+    Used by the in-tmux handoff (``detach-client -E``), whose command runs in a
+    fresh *non-interactive* shell: that shell sources almost nothing, so its PATH
+    may not include the venv/conda env where tuimux lives. The bare name
+    ``tuimux`` would fail there with ``command not found`` — and since the client
+    has already detached, the user is left staring at a blank, frozen terminal.
+
+    So prefer the resolved console script when it's a real file on disk;
+    otherwise fall back to running the module with the current interpreter
+    (``python -m tuimux``), which always works because we are, right now, that
+    very module under that interpreter."""
+    cand = tuimux_bin()
+    if os.path.isabs(cand) and os.path.exists(cand):
+        return [cand]
+    return [sys.executable, "-m", "tuimux"]
+
+
 def main() -> None:
     args = sys.argv[1:]
     _maybe_first_run()  # enable autostart + mouse scroll on the very first run

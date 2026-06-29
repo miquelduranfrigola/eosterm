@@ -25,7 +25,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Header, Footer, DataTable, Label, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from .cli import tuimux_bin
+from .cli import relaunch_argv, tuimux_bin
 
 ENGINE = str(files("tuimux").joinpath("engine.sh"))
 # TUIMUX_BIN tells the engine its own absolute path, so sessions it spawns into
@@ -1329,7 +1329,11 @@ def run():
         cleanup = (
             f"tmux kill-session -t {shlex.quote(sess)} 2>/dev/null; " if sess else ""
         )
-        relaunch = f"{cleanup}TUIMUX_NO_AUTOTMUX=1 exec {shlex.quote(tuimux_bin())}"
+        # Quote each argv token separately: relaunch_argv() may be a multi-word
+        # `python -m tuimux`, which a single shlex.quote() would mangle into one
+        # bogus "python -m tuimux" command name.
+        cmd = " ".join(shlex.quote(a) for a in relaunch_argv())
+        relaunch = f"{cleanup}TUIMUX_NO_AUTOTMUX=1 exec {cmd}"
         try:
             ok = (
                 subprocess.run(
